@@ -12,10 +12,15 @@ set(CMAKE_CXX_STANDARD 20)
 
 find_package(CURL REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(SQLiteCpp REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_library(Magindex STATIC
-        src/importer/bulk_downloader.cpp
-        src/importer/scryfall_client.cpp)
+        src/api/api_interface.cpp
+        src/importer/scryfall_client.cpp
+        src/processor/scryfall_processor.cpp
+        src/importer/scryfall_importer.cpp
+        src/storage/sqlite/sqlite_storage.cpp)
 
 target_include_directories(Magindex
         PUBLIC
@@ -23,7 +28,9 @@ target_include_directories(Magindex
 )
 
 target_link_libraries(Magindex
-        PRIVATE
+        PUBLIC
         CURL::libcurl
         nlohmann_json::nlohmann_json
+        SQLiteCpp
+        ZLIB::ZLIB
 )

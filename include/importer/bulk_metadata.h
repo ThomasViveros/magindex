@@ -3,7 +3,7 @@
 #include <string>
 #include <cstdint>
 
-namespace mtg::importer {
+namespace magindex::importer {
 
 
     /* GET: https://api.scryfall.com/bulk-data/default-cards
@@ -26,7 +26,6 @@ namespace mtg::importer {
         std::string name;
         std::string updated_at;
 
-        std::string download_uri;
         std::string jsonl_download_uri;
 
         std::uint64_t compressed_size = 0;

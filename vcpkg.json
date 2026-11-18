@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "dependencies": [
     "curl",
-    "nlohmann-json"
+    "nlohmann-json",
+    "sqlite3",
+    "sqlitecpp",
+    "zlib"
   ]
 }
