@@ -5,7 +5,6 @@
 
 #include "types/card.h"
 #include "types/update_type.h"
-#include "types/magindex_config.h"
 
 namespace magindex::processor {
     class ProcessorBase {
@@ -22,7 +21,7 @@ namespace magindex::processor {
          * @param path The path to process
          * @param updateType The update type of the download. Useful for determining how to process the file(s)
          */
-        virtual std::vector<types::Card> Process(std::filesystem::path path, UpdateType updateType, const MagindexConfig &config) =
+        virtual std::vector<types::Card> Process(std::filesystem::path path, UpdateType updateType) =
         0;
     };
 }

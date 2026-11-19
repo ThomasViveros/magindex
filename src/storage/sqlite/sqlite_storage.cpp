@@ -9,6 +9,7 @@
 #include <format>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -224,6 +225,19 @@ namespace {
         )sql");
 
         database.exec(R"sql(
+            CREATE TABLE IF NOT EXISTS printing_faces (
+                printing_id TEXT NOT NULL REFERENCES printings(scryfall_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                artist TEXT NULL,
+                artist_id TEXT NULL,
+                image_small TEXT NULL,
+                image_normal TEXT NULL,
+                PRIMARY KEY (printing_id, ordinal)
+            ) WITHOUT ROWID
+        )sql");
+
+        database.exec(R"sql(
             CREATE TABLE IF NOT EXISTS finishes (
                 printing_id TEXT NOT NULL REFERENCES printings(scryfall_id) ON DELETE CASCADE,
                 finish TEXT NOT NULL,
@@ -354,7 +368,7 @@ namespace magindex::storage {
 
     SQLiteStorage::~SQLiteStorage() = default;
 
-    void SQLiteStorage::Store(const CardChunk &cards) {
+    void SQLiteStorage::Store(const CardChunk &cards, bool bOverrideExisting) {
         if (cards.empty())
             return;
 
@@ -362,13 +376,15 @@ namespace magindex::storage {
             SQLite::Database &database = impl_->database;
             SQLite::Transaction transaction(database);
 
-            SQLite::Statement upsertCard(database, R"sql(
+            std::string conflictProtocol = bOverrideExisting ? "DO UPDATE SET" : "DO NOTHING";
+
+            SQLite::Statement upsertCard(database, std::format(R"sql(
             INSERT INTO cards (
                 oracle_id, name, layout, mana_cost, color_identity, colors, cmc,
                 type_line, power, power_numeric, toughness, toughness_numeric,
                 defense, defense_numeric, loyalty, loyalty_numeric, oracle_text
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(oracle_id) DO UPDATE SET
+            ON CONFLICT(oracle_id) {}
                 name = excluded.name,
                 layout = excluded.layout,
                 mana_cost = excluded.mana_cost,
@@ -385,23 +401,23 @@ namespace magindex::storage {
                 loyalty = excluded.loyalty,
                 loyalty_numeric = excluded.loyalty_numeric,
                 oracle_text = excluded.oracle_text
-        )sql");
-            SQLite::Statement upsertSet(database, R"sql(
+        )sql", conflictProtocol));
+            SQLite::Statement upsertSet(database, std::format(R"sql(
             INSERT INTO sets(set_id, code, name, released_at, set_type)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(set_id) DO UPDATE SET
+            ON CONFLICT(set_id) {}
                 code = excluded.code,
                 name = excluded.name,
                 released_at = excluded.released_at,
                 set_type = excluded.set_type
-        )sql");
-            SQLite::Statement upsertPrinting(database, R"sql(
+        )sql", conflictProtocol));
+            SQLite::Statement upsertPrinting(database, std::format(R"sql(
             INSERT INTO printings (
                 scryfall_id, oracle_id, set_id, lang, collector_number, flavor_name,
                 artist, frame, border_color, digital, full_art, oversized, promo,
                 textless, reprint, rarity, image_small, image_normal
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scryfall_id) DO UPDATE SET
+            ON CONFLICT(scryfall_id) {}
                 oracle_id = excluded.oracle_id,
                 set_id = excluded.set_id,
                 lang = excluded.lang,
@@ -419,12 +435,13 @@ namespace magindex::storage {
                 rarity = excluded.rarity,
                 image_small = excluded.image_small,
                 image_normal = excluded.image_normal
-        )sql");
+        )sql", conflictProtocol));
 
             SQLite::Statement deleteFaces(database, "DELETE FROM card_faces WHERE card_id = ?");
             SQLite::Statement deleteKeywords(database, "DELETE FROM keywords WHERE card_id = ?");
             SQLite::Statement deleteLegalities(database, "DELETE FROM legalities WHERE card_id = ?");
             SQLite::Statement deleteFinishes(database, "DELETE FROM finishes WHERE printing_id = ?");
+            SQLite::Statement deletePrintingFaces(database, "DELETE FROM printing_faces WHERE printing_id = ?");
             SQLite::Statement deleteFrameEffects(database, "DELETE FROM frame_effects WHERE printing_id = ?");
             SQLite::Statement deleteArtistIds(database, "DELETE FROM artist_ids WHERE printing_id = ?");
 
@@ -435,6 +452,13 @@ namespace magindex::storage {
                 toughness_numeric, loyalty, loyalty_numeric, type_line, image_small, image_normal
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         )sql");
+            SQLite::Statement upsertPrintingFace(database, R"sql(
+                INSERT INTO printing_faces(printing_id, ordinal, name, artist, artist_id, image_small, image_normal)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(printing_id, ordinal) DO UPDATE SET
+                    name=excluded.name, artist=excluded.artist, artist_id=excluded.artist_id,
+                    image_small=excluded.image_small, image_normal=excluded.image_normal
+            )sql");
             SQLite::Statement insertKeyword(database, "INSERT OR IGNORE INTO keywords(card_id, keyword) VALUES (?, ?)");
             SQLite::Statement insertLegality(database,
                                              "INSERT OR IGNORE INTO legalities(card_id, format, legality) VALUES (?, ?, ?)");
@@ -566,6 +590,21 @@ namespace magindex::storage {
                 upsertPrinting.exec();
                 Reset(upsertPrinting);
 
+                deletePrintingFaces.bind(1, card.id);
+                deletePrintingFaces.exec();
+                Reset(deletePrintingFaces);
+                for (const CardFace &face : card.CardFaces) {
+                    upsertPrintingFace.bind(1, card.id);
+                    upsertPrintingFace.bind(2, static_cast<int>(face.Ordinal));
+                    upsertPrintingFace.bind(3, face.Name);
+                    BindNullableText(upsertPrintingFace, 4, face.Artist);
+                    BindNullableText(upsertPrintingFace, 5, face.ArtistId);
+                    BindNullableText(upsertPrintingFace, 6, face.SmallImageURI);
+                    BindNullableText(upsertPrintingFace, 7, face.NormalImageURI);
+                    upsertPrintingFace.exec();
+                    Reset(upsertPrintingFace);
+                }
+
                 // deleteFinishes.bind(1, card.id);
                 // deleteFinishes.exec();
                 // Reset(deleteFinishes);
@@ -632,193 +671,244 @@ namespace magindex::storage {
         }
     }
 
-    void SQLiteStorage::QueryForCards(const CardQuery &Query, std::vector<Card> &OUTCards) {
-        std::string sql = R"sql(
-            SELECT DISTINCT p.scryfall_id
-            FROM cards c
-            JOIN printings p ON p.oracle_id = c.oracle_id
-            WHERE 1 = 1
-        )sql";
+    void SQLiteStorage::GetAllTrackedSets(std::map<std::string, std::uint64_t> &OUTTrackedSets) {
+        try {
+            SQLite::Statement query(impl_->database,
+                "SELECT set_id, COUNT(*) FROM printings GROUP BY set_id ORDER BY set_id");
+            std::map<std::string, std::uint64_t> results;
+            while (query.executeStep()) {
+                results.emplace(query.getColumn(0).getString(),
+                                static_cast<std::uint64_t>(query.getColumn(1).getInt64()));
+            }
+            OUTTrackedSets = std::move(results);
+        } catch (const std::exception &error) {
+            throw std::runtime_error(std::string("Failed to read tracked sets from SQLite: ") + error.what());
+        }
+    }
+
+    types::QueryPage SQLiteStorage::QueryForCards(const CardQuery &query, types::PageRequest page) {
+        constexpr std::uint32_t MAX_PAGE_SIZE = 1000;
+        if (page.Limit == 0 || page.Limit > MAX_PAGE_SIZE)
+            throw std::invalid_argument("Query page limit must be between 1 and 1000");
+        if (page.Offset > static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()))
+            throw std::invalid_argument("Query page offset is too large");
+
+        std::string fromWhere = "FROM cards c JOIN printings p ON p.oracle_id=c.oracle_id WHERE 1=1";
         std::vector<QueryValue> values;
-
-        if (!Query.Name().empty())
-            AddCondition(sql, values,
-                         "instr(lower(c.name), lower(?)) > 0 OR EXISTS (SELECT 1 FROM card_faces f WHERE f.card_id=c.oracle_id AND instr(lower(f.name), lower(?)) > 0)",
-                         Query.Name());
-        if (!Query.Name().empty()) values.emplace_back(Query.Name());
-
-        if (!Query.Sets().empty()) {
+        if (!query.Name().empty()) {
+            fromWhere += " AND (instr(lower(c.name),lower(?))>0 OR EXISTS "
+                         "(SELECT 1 FROM card_faces f WHERE f.card_id=c.oracle_id AND instr(lower(f.name),lower(?))>0))";
+            values.emplace_back(query.Name());
+            values.emplace_back(query.Name());
+        }
+        if (!query.Sets().empty()) {
             std::string condition = "(";
-            for (std::size_t i = 0; i < Query.Sets().size(); ++i) {
+            for (std::size_t i=0;i<query.Sets().size();++i) {
                 if (i) condition += " OR ";
                 condition += "EXISTS (SELECT 1 FROM sets sx WHERE sx.set_id=p.set_id AND (lower(sx.code)=lower(?) OR sx.set_id=?))";
-                values.emplace_back(Query.Sets()[i]);
-                values.emplace_back(Query.Sets()[i]);
+                values.emplace_back(query.Sets()[i]); values.emplace_back(query.Sets()[i]);
             }
-            condition += ")";
-            sql += " AND (" + condition + ")";
+            fromWhere += " AND " + condition + ")";
         }
+        AddNumericConditions(fromWhere, values, query.Power(), "c.power_numeric", "power_numeric");
+        AddNumericConditions(fromWhere, values, query.Toughness(), "c.toughness_numeric", "toughness_numeric");
+        AddNumericConditions(fromWhere, values, query.Loyalty(), "c.loyalty_numeric", "loyalty_numeric");
+        AddNumericConditions(fromWhere, values, query.Defense(), "c.defense_numeric", "defense_numeric");
+        AddNumericConditions(fromWhere, values, query.CMC(), "c.cmc", "cmc");
 
-        AddNumericConditions(sql, values, Query.Power(), "c.power_numeric", "power_numeric");
-        AddNumericConditions(sql, values, Query.Toughness(), "c.toughness_numeric", "toughness_numeric");
-        AddNumericConditions(sql, values, Query.Loyalty(), "c.loyalty_numeric", "loyalty_numeric");
-        AddNumericConditions(sql, values, Query.Defense(), "c.defense_numeric", "defense_numeric");
-        AddNumericConditions(sql, values, Query.CMC(), "c.cmc", "cmc");
+        if (query.HasColors()) {
+            const auto [op, colors] = query.ColorsFilter();
+            std::string colorType = query.IsColorIdentity() ? "color_identity" : "colors";
 
-        if (Query.HasColors()) {
-            const auto [operation, colors] = Query.ColorsFilter();
-            std::string condition;
-            switch (operation) {
-                case Exactly:
-                    condition = "c.colors = ?";
-                    values.emplace_back(static_cast<int>(colors));
-                    break;
-                case AtMost:
-                    condition = "(c.colors & ?) = c.colors";
-                    values.emplace_back(static_cast<int>(colors));
-                    break;
-                case Including:
-                    condition = "(c.colors & ?) = ?";
-                    values.emplace_back(static_cast<int>(colors));
-                    values.emplace_back(static_cast<int>(colors));
-                    break;
-                default:
-                    throw std::invalid_argument("Invalid color operator");
+            if (op == Exactly) { fromWhere += std::format(" AND c.{}=?", colorType); values.emplace_back(static_cast<int>(colors)); }
+            else if (op == AtMost) { fromWhere += std::format(" AND (c.{0} & ?)=c.{0}", colorType); values.emplace_back(static_cast<int>(colors)); }
+            else if (op == Including) {
+                fromWhere += std::format(" AND (c.{} & ?)=?", colorType);
+                values.emplace_back(static_cast<int>(colors)); values.emplace_back(static_cast<int>(colors));
+            } else throw std::invalid_argument("Invalid color operator");
+        }
+        for (const auto &[format, legality] : query.Legalities()) {
+            if (format.empty()) throw std::invalid_argument("Legality format cannot be empty");
+            std::string expected;
+            switch (legality) {
+                case LegalityOperators::Legal: expected="legal"; break;
+                case LegalityOperators::Banned: expected="banned"; break;
+                case LegalityOperators::NotLegal: expected="not_legal"; break;
+                default: throw std::invalid_argument("Invalid legality operator");
             }
-            sql += " AND (" + condition + ")";
+            fromWhere += " AND EXISTS(SELECT 1 FROM legalities l WHERE l.card_id=c.oracle_id AND l.format=? AND l.legality=?)";
+            values.emplace_back(format); values.emplace_back(expected);
         }
-
-        if (!Query.Legalities().empty()) {
-            for (const auto &[format, legality] : Query.Legalities()) {
-                if (format.empty()) throw std::invalid_argument("Legality format cannot be empty");
-                std::string expected;
-                switch (legality) {
-                    case LegalityOperators::Legal: expected = "legal"; break;
-                    case LegalityOperators::Banned: expected = "banned"; break;
-                    case LegalityOperators::NotLegal: expected = "not_legal"; break;
-                    default: throw std::invalid_argument("Invalid legality operator");
-                }
-                sql += " AND EXISTS (SELECT 1 FROM legalities l WHERE l.card_id=c.oracle_id AND l.format=? AND l.legality=?)";
-                values.emplace_back(format);
-                values.emplace_back(expected);
-            }
-        }
-
-        for (const auto &type : Query.Supertypes()) {
-            sql += " AND EXISTS (SELECT 1 FROM supertypes st WHERE st.card_id=c.oracle_id AND st.supertype=?)";
+        for (const auto &type : query.Supertypes()) {
+            fromWhere += " AND EXISTS(SELECT 1 FROM supertypes st WHERE st.card_id=c.oracle_id AND st.supertype=?)";
             values.emplace_back(type);
         }
-        for (const auto &type : Query.Subtypes()) {
-            sql += " AND EXISTS (SELECT 1 FROM subtypes st WHERE st.card_id=c.oracle_id AND st.subtype=?)";
+        for (const auto &type : query.Subtypes()) {
+            fromWhere += " AND EXISTS(SELECT 1 FROM subtypes st WHERE st.card_id=c.oracle_id AND st.subtype=?)";
             values.emplace_back(type);
         }
-        for (const auto &symbol : Query.ManaSymbols()) {
+        for (const auto &symbol : query.ManaSymbols()) {
             if (!symbol) throw std::invalid_argument("Mana symbol query cannot contain a null symbol");
-            sql += " AND (instr(c.mana_cost, ?) > 0 OR EXISTS (SELECT 1 FROM card_faces f WHERE f.card_id=c.oracle_id AND instr(f.mana_cost, ?) > 0))";
-            values.emplace_back(symbol->GetManaSymbolString());
-            values.emplace_back(symbol->GetManaSymbolString());
+            fromWhere += " AND (instr(c.mana_cost,?)>0 OR EXISTS(SELECT 1 FROM card_faces f "
+                         "WHERE f.card_id=c.oracle_id AND instr(f.mana_cost,?)>0))";
+            values.emplace_back(symbol->GetManaSymbolString()); values.emplace_back(symbol->GetManaSymbolString());
         }
-        if (!Query.Rarities().empty()) {
-            std::string condition = "p.rarity IN (";
-            for (std::size_t i = 0; i < Query.Rarities().size(); ++i) {
-                if (i) condition += ",";
-                condition += "?";
-                values.emplace_back(RarityText(Query.Rarities()[i]));
+        if (!query.Rarities().empty()) {
+            fromWhere += " AND p.rarity IN (";
+            for (std::size_t i=0;i<query.Rarities().size();++i) {
+                if (i) fromWhere += ",";
+                fromWhere += "?"; values.emplace_back(RarityText(query.Rarities()[i]));
             }
-            condition += ")";
-            sql += " AND (" + condition + ")";
+            fromWhere += ")";
         }
 
-        sql += " ORDER BY p.scryfall_id";
+        std::string printingFilter;
+        std::vector<QueryValue> printingValues;
+        if (!query.Sets().empty()) {
+            printingFilter += " AND (";
+            for (std::size_t i=0;i<query.Sets().size();++i) {
+                if (i) printingFilter += " OR ";
+                printingFilter += "(lower(s.code)=lower(?) OR s.set_id=?)";
+                printingValues.emplace_back(query.Sets()[i]); printingValues.emplace_back(query.Sets()[i]);
+            }
+            printingFilter += ")";
+        }
+        if (!query.Rarities().empty()) {
+            printingFilter += " AND p.rarity IN (";
+            for (std::size_t i=0;i<query.Rarities().size();++i) {
+                if (i) printingFilter += ",";
+                printingFilter += "?"; printingValues.emplace_back(RarityText(query.Rarities()[i]));
+            }
+            printingFilter += ")";
+        }
 
         try {
             SQLite::Database &database = impl_->database;
-            std::vector<Card> results;
-            SQLite::Statement findIds(database, sql);
-            BindQueryValues(findIds, values);
+            types::QueryPage result;
+            result.Page = page;
+            SQLite::Statement count(database, "SELECT COUNT(DISTINCT c.oracle_id) " + fromWhere);
+            BindQueryValues(count, values);
+            if (count.executeStep()) result.TotalCards = static_cast<std::uint64_t>(count.getColumn(0).getInt64());
+
+            SQLite::Statement idsQuery(database,
+                "SELECT oracle_id FROM (SELECT DISTINCT c.oracle_id,lower(c.name) AS sort_name " + fromWhere +
+                ") matched_cards ORDER BY sort_name,oracle_id LIMIT ? OFFSET ?");
+            BindQueryValues(idsQuery, values);
+            const int pagingIndex = static_cast<int>(values.size()) + 1;
+            idsQuery.bind(pagingIndex, static_cast<int>(page.Limit));
+            idsQuery.bind(pagingIndex+1, static_cast<std::int64_t>(page.Offset));
             std::vector<std::string> ids;
-            while (findIds.executeStep()) ids.push_back(findIds.getColumn(0).getString());
+            while (idsQuery.executeStep()) ids.push_back(idsQuery.getColumn(0).getString());
 
-            SQLite::Statement loadCard(database, R"sql(
-                SELECT c.oracle_id, c.name, c.layout, c.mana_cost, c.color_identity, c.colors,
-                       c.cmc, c.type_line, c.power, c.toughness, c.defense, c.loyalty, c.oracle_text,
-                       p.scryfall_id, p.lang, p.collector_number, p.flavor_name, p.artist, p.frame,
-                       p.border_color, p.digital, p.full_art, p.oversized, p.promo, p.textless,
-                       p.reprint, p.rarity, p.image_small, p.image_normal,
-                       s.set_id, s.code, s.name, s.set_type, s.released_at
-                FROM printings p JOIN cards c ON c.oracle_id=p.oracle_id
-                JOIN sets s ON s.set_id=p.set_id WHERE p.scryfall_id=?
-            )sql");
-            SQLite::Statement loadFaces(database, "SELECT ordinal,name,artist,artist_id,colors,cmc,mana_cost,defense,power,toughness,loyalty,type_line,image_small,image_normal FROM card_faces WHERE card_id=? ORDER BY ordinal");
-            SQLite::Statement loadKeywords(database, "SELECT keyword FROM keywords WHERE card_id=? ORDER BY keyword");
-            SQLite::Statement loadLegalities(database, "SELECT format,legality FROM legalities WHERE card_id=? ORDER BY format");
-            SQLite::Statement loadFinishes(database, "SELECT finish FROM finishes WHERE printing_id=? ORDER BY finish");
-            SQLite::Statement loadEffects(database, "SELECT effect FROM frame_effects WHERE printing_id=? ORDER BY effect");
-            SQLite::Statement loadArtistIds(database, "SELECT artist_id FROM artist_ids WHERE printing_id=? ORDER BY artist_id");
-            SQLite::Statement loadPromoTypes(database, "SELECT promo_type FROM promo_types WHERE printing_id=? ORDER BY promo_type");
-            SQLite::Statement loadSupertypes(database, "SELECT supertype FROM supertypes WHERE card_id=? ORDER BY supertype");
-            SQLite::Statement loadSubtypes(database, "SELECT subtype FROM subtypes WHERE card_id=? ORDER BY subtype");
+            SQLite::Statement oracleStmt(database,
+                "SELECT oracle_id,name,layout,mana_cost,color_identity,colors,cmc,type_line,power,toughness,defense,loyalty,oracle_text "
+                "FROM cards WHERE oracle_id=?");
+            SQLite::Statement facesStmt(database,
+                "SELECT ordinal,name,colors,cmc,mana_cost,defense,power,toughness,loyalty,type_line FROM card_faces WHERE card_id=? ORDER BY ordinal");
+            SQLite::Statement keywordsStmt(database,"SELECT keyword FROM keywords WHERE card_id=? ORDER BY keyword");
+            SQLite::Statement legalitiesStmt(database,"SELECT format,legality FROM legalities WHERE card_id=? ORDER BY format");
+            SQLite::Statement supersStmt(database,"SELECT supertype FROM supertypes WHERE card_id=? ORDER BY supertype");
+            SQLite::Statement subsStmt(database,"SELECT subtype FROM subtypes WHERE card_id=? ORDER BY subtype");
+            SQLite::Statement printsStmt(database,
+                "SELECT p.scryfall_id,p.lang,p.collector_number,p.flavor_name,p.artist,p.frame,p.border_color,"
+                "p.digital,p.full_art,p.oversized,p.promo,p.textless,p.reprint,p.rarity,p.image_small,p.image_normal,"
+                "s.set_id,s.code,s.name,s.set_type,s.released_at FROM printings p JOIN sets s ON s.set_id=p.set_id "
+                "WHERE p.oracle_id=? " + printingFilter +
+                " ORDER BY s.released_at,s.code,p.collector_number,p.scryfall_id");
+            SQLite::Statement finishesStmt(database,"SELECT finish FROM finishes WHERE printing_id=? ORDER BY finish");
+            SQLite::Statement effectsStmt(database,"SELECT effect FROM frame_effects WHERE printing_id=? ORDER BY effect");
+            SQLite::Statement artistIdsStmt(database,"SELECT artist_id FROM artist_ids WHERE printing_id=? ORDER BY artist_id");
+            SQLite::Statement promoStmt(database,"SELECT promo_type FROM promo_types WHERE printing_id=? ORDER BY promo_type");
+            SQLite::Statement printingFacesStmt(database,
+                "SELECT ordinal,name,artist,artist_id,image_small,image_normal FROM printing_faces WHERE printing_id=? ORDER BY ordinal");
+            SQLite::Statement legacyFaceStmt(database,
+                "SELECT ordinal,name,artist,artist_id,image_small,image_normal FROM card_faces WHERE card_id=? ORDER BY ordinal");
 
-            auto loadStrings = [](SQLite::Statement &statement, const std::string &key, auto insert) {
-                statement.bind(1, key);
-                while (statement.executeStep()) insert(statement.getColumn(0).getString());
-                Reset(statement);
+            auto loadStrings=[](SQLite::Statement &stmt,const std::string &key,auto add) {
+                stmt.bind(1,key);
+                while(stmt.executeStep()) add(stmt.getColumn(0).getString());
+                Reset(stmt);
             };
 
-            for (const std::string &id : ids) {
-                loadCard.bind(1, id);
-                if (!loadCard.executeStep()) {
-                    Reset(loadCard);
-                    continue;
-                }
-                const auto col = [&](int index) { return loadCard.getColumn(index); };
-                Card card;
-                card.OracleId = col(0).getString(); card.Name = col(1).getString();
-                card.Layout = col(2).getString(); card.ManaCost = col(3).getString();
-                card.ColorIdentity = static_cast<Colors>(col(4).getInt()); card.Colors = static_cast<Colors>(col(5).getInt());
-                card.cmc = static_cast<float>(col(6).getDouble()); card.Typeline = col(7).getString();
-                card.Power = col(8).getString(); card.Toughness = col(9).getString();
-                card.Defense = col(10).getString(); card.Loyalty = col(11).getString(); card.OracleText = col(12).getString();
-                card.id = col(13).getString(); card.Language = col(14).getString(); card.CollectorNumber = col(15).getString();
-                card.FlavorName = col(16).getString(); card.Artist = col(17).getString(); card.Frame = col(18).getString();
-                card.BorderColor = col(19).getString(); card.bDigital = col(20).getInt() != 0; card.bFullArt = col(21).getInt() != 0;
-                card.bOversized = col(22).getInt() != 0; card.bPromo = col(23).getInt() != 0; card.bTextless = col(24).getInt() != 0;
-                card.bReprint = col(25).getInt() != 0; card.Rarity = col(26).getString(); card.SmallImageURI = col(27).getString();
-                card.NormalImageURI = col(28).getString(); card.SetId = col(29).getString(); card.SetCode = col(30).getString();
-                card.SetName = col(31).getString(); card.SetType = col(32).getString();
-                const std::string date = col(33).getString();
-                if (date.size() == 10) card.ReleasedAt = std::chrono::year{std::stoi(date.substr(0,4))}/std::stoi(date.substr(5,2))/std::stoi(date.substr(8,2));
-                Reset(loadCard);
+            for (const auto &oracleId : ids) {
+                oracleStmt.bind(1,oracleId);
+                if (!oracleStmt.executeStep()) { Reset(oracleStmt); continue; }
+                auto col=[&](int i){return oracleStmt.getColumn(i);};
+                types::OracleCard card;
+                card.OracleId=col(0).getString(); card.Name=col(1).getString(); card.Layout=col(2).getString();
+                card.ManaCost=col(3).getString(); card.ColorIdentity=static_cast<Colors>(col(4).getInt());
+                card.Colors=static_cast<Colors>(col(5).getInt()); card.Cmc=static_cast<float>(col(6).getDouble());
+                card.TypeLine=col(7).getString(); card.Power=col(8).getString(); card.Toughness=col(9).getString();
+                card.Defense=col(10).getString(); card.Loyalty=col(11).getString(); card.OracleText=col(12).getString();
+                Reset(oracleStmt);
 
-                loadFaces.bind(1, card.OracleId);
-                while (loadFaces.executeStep()) {
-                    const auto faceCol = [&](int index) { return loadFaces.getColumn(index); };
-                    CardFace face;
-                    face.OracleId = card.OracleId;
-                    face.Ordinal = static_cast<std::uint8_t>(faceCol(0).getInt()); face.Name = faceCol(1).getString();
-                    face.Artist = faceCol(2).getString(); face.ArtistId = faceCol(3).getString();
-                    face.Colors = static_cast<Colors>(faceCol(4).getInt()); face.Cmc = static_cast<float>(faceCol(5).getDouble());
-                    face.ManaCost = faceCol(6).getString(); face.Defense = faceCol(7).getString(); face.Power = faceCol(8).getString();
-                    face.Toughness = faceCol(9).getString(); face.Loyalty = faceCol(10).getString(); face.TypeLine = faceCol(11).getString();
-                    face.SmallImageURI = faceCol(12).getString(); face.NormalImageURI = faceCol(13).getString();
-                    card.CardFaces.push_back(std::move(face));
+                facesStmt.bind(1,oracleId);
+                while(facesStmt.executeStep()) {
+                    auto fc=[&](int i){return facesStmt.getColumn(i);};
+                    types::OracleFace face;
+                    face.Ordinal=static_cast<std::uint8_t>(fc(0).getInt()); face.Name=fc(1).getString();
+                    face.Colors=static_cast<Colors>(fc(2).getInt()); face.Cmc=static_cast<float>(fc(3).getDouble());
+                    face.ManaCost=fc(4).getString(); face.Defense=fc(5).getString(); face.Power=fc(6).getString();
+                    face.Toughness=fc(7).getString(); face.Loyalty=fc(8).getString(); face.TypeLine=fc(9).getString();
+                    card.Faces.push_back(std::move(face));
                 }
-                Reset(loadFaces);
-                loadStrings(loadKeywords, card.OracleId, [&](std::string value) { card.Keywords.push_back(std::move(value)); });
-                loadLegalities.bind(1, card.OracleId);
-                while (loadLegalities.executeStep()) card.Legalities.emplace(loadLegalities.getColumn(0).getString(), loadLegalities.getColumn(1).getString());
-                Reset(loadLegalities);
-                loadStrings(loadFinishes, card.id, [&](std::string value) { card.Finishes.push_back(std::move(value)); });
-                loadStrings(loadEffects, card.id, [&](std::string value) { card.FrameEffects.push_back(std::move(value)); });
-                loadStrings(loadArtistIds, card.id, [&](std::string value) { card.ArtistIds.push_back(std::move(value)); });
-                loadStrings(loadPromoTypes, card.id, [&](std::string value) { card.PromoTypes.insert(std::move(value)); });
-                loadStrings(loadSupertypes, card.OracleId, [&](std::string value) { card.SuperTypes.insert(std::move(value)); });
-                loadStrings(loadSubtypes, card.OracleId, [&](std::string value) { card.SubTypes.insert(std::move(value)); });
-                results.push_back(std::move(card));
+                Reset(facesStmt);
+                loadStrings(keywordsStmt,oracleId,[&](std::string v){card.Keywords.push_back(std::move(v));});
+                legalitiesStmt.bind(1,oracleId);
+                while(legalitiesStmt.executeStep()) card.Legalities.emplace(legalitiesStmt.getColumn(0).getString(),legalitiesStmt.getColumn(1).getString());
+                Reset(legalitiesStmt);
+                loadStrings(supersStmt,oracleId,[&](std::string v){card.SuperTypes.insert(std::move(v));});
+                loadStrings(subsStmt,oracleId,[&](std::string v){card.SubTypes.insert(std::move(v));});
+
+                printsStmt.bind(1,oracleId);
+                int filterIndex=2;
+                for(const auto &v:printingValues) std::visit([&](const auto &item){printsStmt.bind(filterIndex++,item);},v);
+                while(printsStmt.executeStep()) {
+                    auto pc=[&](int i){return printsStmt.getColumn(i);};
+                    types::Printing p;
+                    p.Id=pc(0).getString(); p.Language=pc(1).getString(); p.CollectorNumber=pc(2).getString();
+                    p.FlavorName=pc(3).getString(); p.Artist=pc(4).getString(); p.Frame=pc(5).getString();
+                    p.BorderColor=pc(6).getString(); p.Digital=pc(7).getInt()!=0; p.FullArt=pc(8).getInt()!=0;
+                    p.Oversized=pc(9).getInt()!=0; p.Promo=pc(10).getInt()!=0; p.Textless=pc(11).getInt()!=0;
+                    p.Reprint=pc(12).getInt()!=0; p.Rarity=pc(13).getString(); p.SmallImageURI=pc(14).getString();
+                    p.NormalImageURI=pc(15).getString(); p.SetId=pc(16).getString(); p.SetCode=pc(17).getString();
+                    p.SetName=pc(18).getString(); p.SetType=pc(19).getString();
+                    const std::string date=pc(20).getString();
+                    if(date.size()==10) p.ReleasedAt=std::chrono::year{std::stoi(date.substr(0,4))} /
+                        std::chrono::month{static_cast<unsigned>(std::stoi(date.substr(5,2)))} /
+                        std::chrono::day{static_cast<unsigned>(std::stoi(date.substr(8,2)))};
+                    loadStrings(finishesStmt,p.Id,[&](std::string v){p.Finishes.push_back(std::move(v));});
+                    loadStrings(effectsStmt,p.Id,[&](std::string v){p.FrameEffects.push_back(std::move(v));});
+                    loadStrings(artistIdsStmt,p.Id,[&](std::string v){p.ArtistIds.push_back(std::move(v));});
+                    loadStrings(promoStmt,p.Id,[&](std::string v){p.PromoTypes.insert(std::move(v));});
+                    printingFacesStmt.bind(1,p.Id);
+                    while(printingFacesStmt.executeStep()) {
+                        auto fc=[&](int i){return printingFacesStmt.getColumn(i);};
+                        types::PrintingFace f; f.Ordinal=static_cast<std::uint8_t>(fc(0).getInt());
+                        f.Name=fc(1).getString(); f.Artist=fc(2).getString(); f.ArtistId=fc(3).getString();
+                        f.SmallImageURI=fc(4).getString(); f.NormalImageURI=fc(5).getString();
+                        p.Faces.push_back(std::move(f));
+                    }
+                    Reset(printingFacesStmt);
+                    if(p.Faces.empty()) {
+                        legacyFaceStmt.bind(1,oracleId);
+                        while(legacyFaceStmt.executeStep()) {
+                            auto fc=[&](int i){return legacyFaceStmt.getColumn(i);};
+                            types::PrintingFace f; f.Ordinal=static_cast<std::uint8_t>(fc(0).getInt());
+                            f.Name=fc(1).getString(); f.Artist=fc(2).getString(); f.ArtistId=fc(3).getString();
+                            f.SmallImageURI=fc(4).getString(); f.NormalImageURI=fc(5).getString();
+                            p.Faces.push_back(std::move(f));
+                        }
+                        Reset(legacyFaceStmt);
+                    }
+                    card.Printings.push_back(std::move(p));
+                }
+                Reset(printsStmt);
+                result.Cards.push_back(std::move(card));
             }
-            OUTCards = std::move(results);
-        } catch (const std::exception &error) {
-            throw std::runtime_error(std::string("Failed to query cards from SQLite: ") + error.what());
+            return result;
+        } catch(const std::exception &error) {
+            throw std::runtime_error(std::string("Failed to query cards from SQLite: ")+error.what());
         }
     }
 }

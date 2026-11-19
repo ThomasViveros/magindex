@@ -544,14 +544,14 @@ namespace magindex::importer {
 
 
     ImportResult
-    ScryfallImporter::ImportCardsForInitialization(std::filesystem::path directory, const MagindexConfig &config) {
+    ScryfallImporter::ImportCardsForInitialization(const std::filesystem::path& directory, std::chrono::sys_time<std::chrono::days> LastUpdated) {
         ImportResult importResult;
 
         BulkMetadata bulkMetadata = GetBulkMetadata();
 
         constexpr const char *bulkDataFileName = "bulk-data.jsonl.gz";
 
-        if (config.LastUpdated >= parseTimestamp(bulkMetadata.updated_at)) {
+        if (LastUpdated >= parseTimestamp(bulkMetadata.updated_at)) {
             LogInfo("Bulk card data is already current");
             importResult.UpdateType = UpdateType::None;
             return importResult;
@@ -626,7 +626,20 @@ namespace magindex::importer {
         return std::string(finalUrl.get());
     }
 
-    json RequestPage(CURL *curl, std::string url) {
+    std::string makeScryfallCardUrl(CURL* curl, const std::string& cardName) {
+
+        char* encodedName = curl_easy_escape(curl, cardName.c_str(), 0);
+        if (!encodedName) {
+            return {};
+        }
+
+        std::string url = "https://api.scryfall.com/cards/search?q=%21%22" + std::string(encodedName) + "%22";
+
+        curl_free(encodedName);
+        return url;
+    }
+
+    json RequestPage(CURL *curl, const std::string& url) {
         std::string response;
 
         CurlHeaders headers = MakeJsonHeaders(curl);
@@ -686,65 +699,18 @@ namespace magindex::importer {
         }
     }
 
-    ImportResult ScryfallImporter::ImportCardsForUpdate(std::filesystem::path directory, const MagindexConfig &config) {
-        ImportResult importResult;
+    bool CrawlPages(CURL* curl, const std::string& url, json& OUTCards, std::optional<uint64_t> Limit) {
+        json page = RequestPage(curl, url);
 
-        std::vector<SetMetadata> setMetadata;
-        GetSetMetadata(setMetadata);
-
-        constexpr const char *importFileName = "incremental_update.jsonl";
-
-        importResult.InstallFilePath = directory / importFileName;
-
-        for (auto &set: setMetadata) {
-            if (config.SetsTypesToIgnore.contains(set.setType)) {
-                continue;
-            }
-
-            if (auto it = config.TrackedSets.find(set.id); it != config.TrackedSets.end()) {
-                //Currently not checking if our count is greater or less than, typically our count would be less than
-                //but perhaps its worth clarifying as we may need to remove a card
-                if (it->second != set.cardCount) {
-                    importResult.SetsToUpdate.emplace_back(set.code);
-                }
-            } else {
-                //If we dont have the set tracked at all add it.
-                importResult.SetsToUpdate.emplace_back(set.code);
-            }
+        if (Limit.has_value() && page["total_cards"].get<std::uint64_t>() > Limit) {
+            return false;
         }
-
-        if (importResult.SetsToUpdate.empty()) {
-            //We are all up to date
-            LogInfo("No sets need an incremental update");
-            importResult.UpdateType = UpdateType::None;
-            return importResult;
-        }
-
-        LogInfo("Found " + std::to_string(importResult.SetsToUpdate.size()) + " sets to update");
-
-        // Retrieve the cards for sets that need an update.
-        CurlHandle curl(curl_easy_init());
-        if (!curl)
-            throw std::runtime_error("Failed to create CURL handle");
-
-        std::string url = makeScryfallSetUrl(curl.get(), importResult.SetsToUpdate);
-
-        json page = RequestPage(curl.get(), url);
-
-        if (page["total_cards"].get<std::uint64_t>() > MAX_CARD_COUNT_FOR_INCREMENTAL_UPDATE) {
-            //Switch to bulk update.
-            LogInfo("Incremental result exceeds threshold; switching to bulk update");
-            importResult.UpdateType = UpdateType::IncrementalUsingBulk;
-            return importResult;
-        }
-
-        json allCards = json::array();
 
         std::string currentUrl;
         do {
             // Append this page's cards
             for (const auto &card: page["data"]) {
-                allCards.push_back(card);
+                OUTCards.push_back(card);
             }
 
             // Determine whether another page exists
@@ -759,8 +725,143 @@ namespace magindex::importer {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(MILLISECONDS_BETWEEN_INCREMENTAL_UPGRADE_PAGE_REQUEST));
 
-            page = RequestPage(curl.get(), currentUrl);
+            page = RequestPage(curl, currentUrl);
         } while (!currentUrl.empty());
+        return true;
+    }
+
+    void SaveCardsInJson(const std::filesystem::path& FilePath, const json& Cards) {
+        if (!FilePath.parent_path().empty()) {
+            std::error_code directoryError;
+            std::filesystem::create_directories(FilePath.parent_path(), directoryError);
+            if (directoryError) {
+                const std::string message = "Failed to create incremental update directory: " +
+                                            directoryError.message();
+                LogError(message);
+                throw std::runtime_error(message);
+            }
+        }
+        std::ofstream newFile(FilePath);
+        if (!newFile) {
+            const std::string message = "Failed to create incremental update file: " + FilePath.string();
+            LogError(message);
+            throw std::runtime_error(message);
+        }
+
+        for (auto &card: Cards) {
+            newFile << card.dump() << '\n';
+        }
+
+        newFile.close();
+        if (!newFile) {
+            const std::string message = "Failed to write incremental update file: " + FilePath.string();
+            LogError(message);
+            throw std::runtime_error(message);
+        }
+    }
+
+    ImportResult ScryfallImporter::ImportCardsForSetPatch(const std::vector<std::string>& Sets, const std::filesystem::path &directory) {
+
+        ImportResult importResult;
+
+        constexpr const char *importFileName = "set_patch.jsonl";
+
+        importResult.InstallFilePath = directory / importFileName;
+
+        json OUTCards = json::array();
+
+        // Retrieve the cards for sets that need an update.
+        CurlHandle curl(curl_easy_init());
+        if (!curl)
+            throw std::runtime_error("Failed to create CURL handle");
+
+        std::string url = makeScryfallSetUrl(curl.get(), Sets);
+
+        CrawlPages(curl.get(), url, OUTCards, std::nullopt);
+
+        SaveCardsInJson(importResult.InstallFilePath, OUTCards);
+
+        return importResult;
+    }
+
+    ImportResult ScryfallImporter::ImportCardForPatch(const std::filesystem::path &directory, const std::string& cardName) {
+        ImportResult importResult;
+
+        constexpr const char *importFileName = "card_patch.jsonl";
+
+        importResult.InstallFilePath = directory / importFileName;
+
+        json OUTCards = json::array();
+
+        // Retrieve the cards for sets that need an update.
+        CurlHandle curl(curl_easy_init());
+        if (!curl)
+            throw std::runtime_error("Failed to create CURL handle");
+
+        std::string url = makeScryfallCardUrl(curl.get(), cardName);
+
+        CrawlPages(curl.get(), url, OUTCards, std::nullopt);
+
+        SaveCardsInJson(importResult.InstallFilePath, OUTCards);
+
+        return importResult;
+    }
+
+    ImportResult ScryfallImporter::ImportCardsForUpdate(const std::filesystem::path& directory,
+        const std::map<std::string, uint64_t>& TrackedSets,
+        const std::set<std::string>& SetTypesToIgnore) {
+
+        ImportResult importResult;
+
+        std::vector<SetMetadata> setMetadata;
+        GetSetMetadata(setMetadata);
+
+        constexpr const char *importFileName = "incremental_update.jsonl";
+
+        importResult.InstallFilePath = directory / importFileName;
+
+        std::vector<std::string> setsToUpdate;
+
+        for (auto &set: setMetadata) {
+            if (SetTypesToIgnore.contains(set.setType)) {
+                continue;
+            }
+
+            if (auto it = TrackedSets.find(set.id); it != TrackedSets.end()) {
+                //Currently not checking if our count is greater or less than, typically our count would be less than
+                //but perhaps its worth clarifying as we may need to remove a card
+                if (it->second != set.cardCount) {
+                    setsToUpdate.emplace_back(set.code);
+                }
+            } else {
+                //If we dont have the set tracked at all add it.
+                setsToUpdate.emplace_back(set.code);
+            }
+        }
+
+        if (setsToUpdate.empty()) {
+            //We are all up to date
+            LogInfo("No sets need an incremental update");
+            importResult.UpdateType = UpdateType::None;
+            return importResult;
+        }
+
+        LogInfo("Found " + std::to_string(setsToUpdate.size()) + " sets to update");
+
+        // Retrieve the cards for sets that need an update.
+        CurlHandle curl(curl_easy_init());
+        if (!curl)
+            throw std::runtime_error("Failed to create CURL handle");
+
+        json allCards = json::array();
+        std::string url = makeScryfallSetUrl(curl.get(), setsToUpdate);
+
+        if (!CrawlPages(curl.get(), url,allCards ,MAX_CARD_COUNT_FOR_INCREMENTAL_UPDATE)) {
+            //Switch to bulk update.
+            LogInfo("Incremental result exceeds threshold; switching to bulk update");
+            importResult.UpdateType = UpdateType::IncrementalUsingBulk;
+            return importResult;
+        }
 
         if (allCards.empty()) {
             //We didnt get any cards. Scryfall potentially listed new sets with no leaked cards
@@ -769,35 +870,7 @@ namespace magindex::importer {
             return importResult;
         }
 
-        if (!importResult.InstallFilePath.parent_path().empty()) {
-            std::error_code directoryError;
-            std::filesystem::create_directories(importResult.InstallFilePath.parent_path(), directoryError);
-            if (directoryError) {
-                const std::string message = "Failed to create incremental update directory: " +
-                                            directoryError.message();
-                LogError(message);
-                throw std::runtime_error(message);
-            }
-        }
-        std::ofstream newFile(importResult.InstallFilePath);
-        if (!newFile) {
-            const std::string message = "Failed to create incremental update file: " +
-                                        importResult.InstallFilePath.string();
-            LogError(message);
-            throw std::runtime_error(message);
-        }
-
-        for (auto &card: allCards) {
-            newFile << card.dump() << '\n';
-        }
-
-        newFile.close();
-        if (!newFile) {
-            const std::string message = "Failed to write incremental update file: " +
-                                        importResult.InstallFilePath.string();
-            LogError(message);
-            throw std::runtime_error(message);
-        }
+        SaveCardsInJson(importResult.InstallFilePath, allCards);
 
         importResult.UpdateType = UpdateType::Incremental;
         LogInfo("Prepared incremental update with " + std::to_string(allCards.size()) + " cards");

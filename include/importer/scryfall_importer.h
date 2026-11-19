@@ -10,11 +10,16 @@ namespace magindex::importer {
         ScryfallImporter();
 
         //~ImporterBase Interface
-        virtual ImportResult
-        ImportCardsForInitialization(std::filesystem::path directory, const MagindexConfig &config) override;
+        ImportResult
+        ImportCardsForInitialization(const std::filesystem::path& directory, std::chrono::sys_time<std::chrono::days> lastUpdated) override;
 
-        virtual ImportResult
-        ImportCardsForUpdate(std::filesystem::path directory, const MagindexConfig &config) override;
+        ImportResult
+        ImportCardsForUpdate(const std::filesystem::path& directory,
+            const std::map<std::string,uint64_t>& TrackedSets, const std::set<std::string>& SetTypesToIgnore) override;
+
+        ImportResult ImportCardsForSetPatch(const std::vector<std::string>& Sets, const std::filesystem::path& Directory) override;
+
+        ImportResult ImportCardForPatch(const std::filesystem::path &directory, const std::string& cardName) override;
 
         //~End of ImporterBase Interface
 

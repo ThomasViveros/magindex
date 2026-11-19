@@ -14,6 +14,8 @@
 #include <string>
 #include <utility>
 
+#include "importer/scryfall_importer.h"
+#include "processor/scryfall_processor.h"
 #include "storage/sqlite/sqlite_storage.h"
 
 namespace {
@@ -31,7 +33,7 @@ namespace {
     };
 
     std::string Lower(std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        std::ranges::transform(value, value.begin(), [](unsigned char ch) {
             return static_cast<char>(std::tolower(ch));
         });
         return value;
@@ -164,6 +166,25 @@ namespace {
         return query;
     }
 
+    PageRequest ParsePage(const json &root) {
+        PageRequest page;
+        if (root.contains("offset")) {
+            if (!root["offset"].is_number_unsigned() &&
+                !(root["offset"].is_number_integer() && root["offset"].get<std::int64_t>() >= 0))
+                throw std::invalid_argument("'offset' must be a nonnegative integer");
+            page.Offset = root["offset"].get<std::uint64_t>();
+        }
+        if (root.contains("limit")) {
+            if (!root["limit"].is_number_unsigned() &&
+                !(root["limit"].is_number_integer() && root["limit"].get<std::int64_t>() > 0))
+                throw std::invalid_argument("'limit' must be a positive integer");
+            const auto limit = root["limit"].get<std::uint64_t>();
+            if (limit > 1000) throw std::invalid_argument("'limit' cannot exceed 1000");
+            page.Limit = static_cast<std::uint32_t>(limit);
+        }
+        return page;
+    }
+
     json ColorsJson(Colors colors) {
         json result = json::array();
         constexpr std::pair<Colors, const char *> entries[] = {
@@ -173,37 +194,60 @@ namespace {
         return result;
     }
 
-    json CardJson(const Card &card) {
-        json faces = json::array();
-        for (const auto &face : card.CardFaces) {
-            faces.push_back({{"name", face.Name}, {"ordinal", face.Ordinal}, {"oracle_id", face.OracleId},
-                {"artist", face.Artist}, {"artist_id", face.ArtistId}, {"cmc", face.Cmc},
+    json OracleFaceJson(const OracleFace &face) {
+        return {{"ordinal", face.Ordinal}, {"name", face.Name}, {"cmc", face.Cmc},
                 {"colors", ColorsJson(face.Colors)}, {"supertypes", face.SuperTypes}, {"subtypes", face.SubTypes},
                 {"mana_cost", face.ManaCost}, {"defense", face.Defense}, {"power", face.Power},
-                {"toughness", face.Toughness}, {"loyalty", face.Loyalty}, {"type_line", face.TypeLine},
-                {"image_small", face.SmallImageURI}, {"image_normal", face.NormalImageURI}});
+                {"toughness", face.Toughness}, {"loyalty", face.Loyalty}, {"type_line", face.TypeLine}};
+    }
+
+    json PrintingJson(const Printing &printing) {
+        json faces = json::array();
+        for (const auto &face : printing.Faces) {
+            faces.push_back({{"ordinal", face.Ordinal}, {"name", face.Name}, {"artist", face.Artist},
+                {"artist_id", face.ArtistId}, {"image_small", face.SmallImageURI},
+                {"image_normal", face.NormalImageURI}});
         }
-        const auto date = card.ReleasedAt;
+        const auto date = printing.ReleasedAt;
         std::string releasedAt;
         if (date.ok()) {
             releasedAt = std::to_string(static_cast<int>(date.year())) + "-" +
                 (static_cast<unsigned>(date.month()) < 10 ? "0" : "") + std::to_string(static_cast<unsigned>(date.month())) + "-" +
                 (static_cast<unsigned>(date.day()) < 10 ? "0" : "") + std::to_string(static_cast<unsigned>(date.day()));
         }
-        return {{"id", card.id}, {"oracle_id", card.OracleId}, {"language", card.Language}, {"layout", card.Layout},
-            {"name", card.Name}, {"cmc", card.cmc}, {"colors", ColorsJson(card.Colors)},
-            {"color_identity", ColorsJson(card.ColorIdentity)}, {"power", card.Power}, {"toughness", card.Toughness},
+        return {{"id", printing.Id}, {"language", printing.Language},
+            {"collector_number", printing.CollectorNumber}, {"flavor_name", printing.FlavorName},
+            {"artist", printing.Artist}, {"artist_ids", printing.ArtistIds}, {"border_color", printing.BorderColor},
+            {"digital", printing.Digital}, {"finishes", printing.Finishes}, {"frame", printing.Frame},
+            {"frame_effects", printing.FrameEffects}, {"promo_types", printing.PromoTypes},
+            {"full_art", printing.FullArt}, {"image_small", printing.SmallImageURI},
+            {"image_normal", printing.NormalImageURI}, {"oversized", printing.Oversized},
+            {"promo", printing.Promo}, {"rarity", printing.Rarity}, {"released_at", releasedAt},
+            {"reprint", printing.Reprint}, {"set_id", printing.SetId}, {"set_code", printing.SetCode},
+            {"set_name", printing.SetName}, {"set_type", printing.SetType},
+            {"textless", printing.Textless}, {"faces", std::move(faces)}};
+    }
+
+    json OracleCardJson(const OracleCard &card) {
+        json faces = json::array();
+        for (const auto &face : card.Faces) faces.push_back(OracleFaceJson(face));
+        json printings = json::array();
+        for (const auto &printing : card.Printings) printings.push_back(PrintingJson(printing));
+        return {{"oracle_id", card.OracleId}, {"name", card.Name}, {"layout", card.Layout},
+            {"cmc", card.Cmc}, {"color_identity", ColorsJson(card.ColorIdentity)},
+            {"colors", ColorsJson(card.Colors)}, {"power", card.Power}, {"toughness", card.Toughness},
             {"defense", card.Defense}, {"loyalty", card.Loyalty}, {"mana_cost", card.ManaCost},
-            {"type_line", card.Typeline}, {"keywords", card.Keywords}, {"legalities", card.Legalities},
+            {"type_line", card.TypeLine}, {"keywords", card.Keywords}, {"legalities", card.Legalities},
             {"oracle_text", card.OracleText}, {"supertypes", card.SuperTypes}, {"subtypes", card.SubTypes},
-            {"faces", std::move(faces)}, {"artist", card.Artist}, {"artist_ids", card.ArtistIds},
-            {"border_color", card.BorderColor}, {"collector_number", card.CollectorNumber}, {"digital", card.bDigital},
-            {"finishes", card.Finishes}, {"flavor_name", card.FlavorName}, {"frame", card.Frame},
-            {"frame_effects", card.FrameEffects}, {"promo_types", card.PromoTypes}, {"full_art", card.bFullArt},
-            {"image_small", card.SmallImageURI}, {"image_normal", card.NormalImageURI},
-            {"oversized", card.bOversized}, {"promo", card.bPromo}, {"rarity", card.Rarity},
-            {"released_at", releasedAt}, {"reprint", card.bReprint}, {"set_id", card.SetId},
-            {"set_code", card.SetCode}, {"set_name", card.SetName}, {"set_type", card.SetType}, {"textless", card.bTextless}};
+            {"faces", std::move(faces)}, {"printings", std::move(printings)}};
+    }
+
+    void ParseSetTypesToIgnore(const json& object, std::set<std::string> OUTSetTypesToIgnore) {
+        if (object.contains("SetTypesToIgnore") && object["SetTypesToIgnore"].is_array()) {
+            for (const auto& set : object["SetTypesToIgnore"]) {
+                OUTSetTypesToIgnore.insert(set.get<std::string>());
+            }
+        }
     }
 
     MagindexStatus StatusForException(const std::exception &error) {
@@ -225,11 +269,19 @@ namespace magindex::api {
     Context::Context(const std::filesystem::path &databasePath) : impl_(std::make_unique<Impl>(databasePath)) {}
     Context::~Context() = default;
 
-    std::vector<types::Card> Context::Query(const types::CardQuery &query) {
+    types::QueryPage Context::Query(const types::CardQuery &query, types::PageRequest page) {
         std::lock_guard lock(impl_->mutex);
-        std::vector<types::Card> cards;
-        impl_->storage.QueryForCards(query, cards);
-        return cards;
+        return impl_->storage.QueryForCards(query, page);
+    }
+
+    void Context::GetTrackedSets(std::map<std::string, uint64_t>& OUTTrackedSets) {
+        std::lock_guard lock(impl_->mutex);
+        impl_->storage.GetAllTrackedSets(OUTTrackedSets);
+    }
+
+    void Context::StoreCards(const std::vector<types::Card> &Cards) {
+        std::lock_guard lock(impl_->mutex);
+        impl_->storage.Store(Cards);
     }
 
     void Context::Clear() {
@@ -239,20 +291,23 @@ namespace magindex::api {
 }
 
 struct MagindexHandle {
-    explicit MagindexHandle(const std::filesystem::path &path) : context(path) {}
+
+    MagindexHandle() = delete;
+    explicit MagindexHandle(const std::filesystem::path& magindexEnvironmentPath, const std::filesystem::path &path) : MagindexEnvironmentPath(magindexEnvironmentPath), context(path) {}
+    const std::filesystem::path MagindexEnvironmentPath;
     magindex::api::Context context;
     std::mutex mutex;
     std::string lastError;
 };
 
-extern "C" MagindexStatus magindex_open(const char *database_path_utf8, MagindexHandle **out_handle) {
+extern "C" MagindexStatus magindex_open(const char* magindex_path_utf8, const char *database_path_utf8, MagindexHandle **out_handle) {
     if (out_handle) *out_handle = nullptr;
     if (!database_path_utf8 || !out_handle || database_path_utf8[0] == '\0') {
         lastOpenError = "Database path and output handle are required";
         return MAGINDEX_STATUS_INVALID_ARGUMENT;
     }
     try {
-        *out_handle = new MagindexHandle(std::filesystem::u8path(database_path_utf8));
+        *out_handle = new MagindexHandle(std::filesystem::path(magindex_path_utf8), std::filesystem::path(database_path_utf8));
         lastOpenError.clear();
         return MAGINDEX_STATUS_OK;
     } catch (const std::exception &error) {
@@ -267,6 +322,50 @@ extern "C" MagindexStatus magindex_open(const char *database_path_utf8, Magindex
 extern "C" void magindex_close(MagindexHandle *handle) {
     delete handle;
 }
+
+MagindexStatus magindex_update(MagindexHandle* handle, const char *ignore_set_type_json) {
+    if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
+    try {
+        const json parsed = json::parse(ignore_set_type_json);
+
+        std::set<std::string> setTypesToIgnore;
+
+        ParseSetTypesToIgnore(parsed, setTypesToIgnore);
+
+        magindex::importer::ScryfallImporter importer;
+
+        std::map<std::string, std::uint64_t> trackedSets;
+        handle->context.GetTrackedSets(trackedSets);
+
+        magindex::importer::ImportResult importResult = importer.ImportCardsForUpdate(handle->MagindexEnvironmentPath, trackedSets, setTypesToIgnore);
+
+        magindex::processor::ScryfallProcessor processor;
+
+        std::vector<Card> processedCards = processor.Process(importResult.InstallFilePath, importResult.UpdateType);
+
+        handle->context.StoreCards(processedCards);
+
+        return MAGINDEX_STATUS_OK;
+    }catch (...) {
+        return MAGINDEX_STATUS_INTERNAL_ERROR;
+    }
+}
+
+MagindexStatus magindex_patch_set(MagindexHandle* handle, const char* set_id_utf8) {
+
+    if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
+    if (!set_id_utf8 || set_id_utf8[0] == '\0') return MAGINDEX_STATUS_INVALID_ARGUMENT;
+
+    try {
+
+
+    }catch (...) {
+        return MAGINDEX_STATUS_INTERNAL_ERROR;
+    }
+
+    return MAGINDEX_STATUS_OK;
+}
+
 
 extern "C" MagindexStatus magindex_clear(MagindexHandle *handle) {
     if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
@@ -294,10 +393,14 @@ extern "C" MagindexStatus magindex_query_json(MagindexHandle *handle, const char
     try {
         const json parsed = json::parse(query_json);
         const CardQuery query = ParseQuery(parsed);
+        const PageRequest page = ParsePage(parsed);
         std::lock_guard lock(handle->mutex);
-        const auto cards = handle->context.Query(query);
-        json result = json::array();
-        for (const auto &card : cards) result.push_back(CardJson(card));
+        const auto pageResult = handle->context.Query(query, page);
+        json cards = json::array();
+        for (const auto &card : pageResult.Cards) cards.push_back(OracleCardJson(card));
+        json result = {{"total_cards", pageResult.TotalCards}, {"offset", pageResult.Page.Offset},
+                       {"limit", pageResult.Page.Limit}, {"has_more", pageResult.HasMore()},
+                       {"cards", std::move(cards)}};
         const std::string output = result.dump();
         auto *buffer = static_cast<char *>(std::malloc(output.size() + 1));
         if (!buffer) throw std::bad_alloc();

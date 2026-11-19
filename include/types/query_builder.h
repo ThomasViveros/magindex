@@ -77,9 +77,13 @@ public:
     }
 
     //Not cummulative
-    CardQuery *ColorsParam(ColorOperators ColorOperator, Colors InColors) {
+    CardQuery *ColorsParam(ColorOperators ColorOperator, Colors InColors, bool bIsColorIdentity = false) {
+        if (InColors == Color::NA) {
+            throw std::invalid_argument("Invalid color operator");
+        }
         _colors = {ColorOperator, InColors};
         _hasColors = true;
+        _isColorIdentity = bIsColorIdentity;
         return this;
     }
 
@@ -125,6 +129,7 @@ public:
     [[nodiscard]] const std::vector<NumericalQuery> &Loyalty() const noexcept { return _loyalty; }
     [[nodiscard]] const std::vector<NumericalQuery> &Defense() const noexcept { return _defense; }
     [[nodiscard]] bool HasColors() const noexcept { return _hasColors; }
+    [[nodiscard]] bool IsColorIdentity() const noexcept { return _isColorIdentity; }
     [[nodiscard]] const auto &ColorsFilter() const noexcept { return _colors; }
     [[nodiscard]] const std::map<std::string, LegalityOperators> &Legalities() const noexcept { return _legalities; }
     [[nodiscard]] const std::vector<std::string> &Supertypes() const noexcept { return _supertypes; }
@@ -143,6 +148,8 @@ private:
     std::vector<NumericalQuery> _defense;
     std::tuple<ColorOperators, Colors> _colors;
     bool _hasColors = false;
+    //If the colors should represent the identity.
+    bool _isColorIdentity = false;
     std::map<std::string, LegalityOperators> _legalities;
     std::vector<std::string> _supertypes;
     std::vector<std::string> _subtypes;

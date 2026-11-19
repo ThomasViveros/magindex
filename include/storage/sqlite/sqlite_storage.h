@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <SQLiteCpp/Database.h>
 
@@ -32,11 +34,14 @@ namespace magindex::storage {
 
         SQLiteStorage &operator=(const SQLiteStorage &) = delete;
 
-        void Store(const CardChunk &cards) override;
+        void Store(const CardChunk &cards, bool bOverrideExisting = false) override;
 
         void EmptyStorage() override;
 
-        void QueryForCards(const types::CardQuery &Query, std::vector<types::Card> &OUTCards) override;
+        void GetAllTrackedSets(std::map<std::string, std::uint64_t> &OUTTrackedSets) override;
+
+        types::QueryPage QueryForCards(const types::CardQuery &query,
+                                       types::PageRequest page = {}) override;
 
     private:
 

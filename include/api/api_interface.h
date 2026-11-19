@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "types/card.h"
+#include "types/oracle_card.h"
 #include "types/query_builder.h"
 
 namespace magindex::api {
@@ -21,7 +22,13 @@ namespace magindex::api {
         Context(const Context &) = delete;
         Context &operator=(const Context &) = delete;
 
-        [[nodiscard]] std::vector<types::Card> Query(const types::CardQuery &query);
+        [[nodiscard]] types::QueryPage Query(const types::CardQuery &query,
+                                             types::PageRequest page = {});
+
+        void StoreCards(const std::vector<types::Card>& Cards);
+
+        void GetTrackedSets(std::map<std::string, uint64_t>& OUTTrackedSets);
+
         void Clear();
 
     private:
@@ -44,18 +51,40 @@ typedef enum MagindexStatus {
     MAGINDEX_STATUS_INTERNAL_ERROR = 5
 } MagindexStatus;
 
+//magindex_path_utf8 is a directory that
 // database_path_utf8 names the SQLite database file, not a directory.
-MagindexStatus magindex_open(const char *database_path_utf8, MagindexHandle **out_handle);
+MagindexStatus magindex_open(const char* magindex_path_utf8, const char *database_path_utf8, MagindexHandle **out_handle);
 void magindex_close(MagindexHandle *handle);
+
+/**
+ *
+ * @param handle Handle generated from magindex_open call
+ * @param ignore_set_type_json Optional set types to ignore.
+ * @return Status
+ */
+MagindexStatus magindex_update(MagindexHandle* handle, const char *ignore_set_type_json);
+
+    MagindexStatus magindex_patch_set();
+
+    void magindex_patch_card();
+
+
+
+    //Emptys the database
 MagindexStatus magindex_clear(MagindexHandle *handle);
 
-// query_json and result_json are UTF-8. The result buffer is allocated by the
+// query_json and result_json are UTF-8. Query JSON can also include optional
+// pagination fields: offset (default 0) and limit (default 50, maximum 1000).
+// The result is an object with total_cards, offset, limit, has_more, and cards.
+// The result buffer is allocated by the
 // library and must be released with magindex_free_string().
 // Query JSON accepts these optional keys:
 //   name: string; sets/supertypes/subtypes/mana_symbols/rarities: string arrays
 //   power/toughness/loyalty/defense/cmc: arrays of {"op":">=","value":2,"logic":"and"}
 //   colors: {"op":"exactly|at_most|including","colors":["W","U"]}
 //   legalities: format-to-status object, e.g. {"commander":"legal"}
+// Set and rarity filters restrict which printings are included under each
+// matching Oracle card. Other filters determine whether the Oracle card matches.
 MagindexStatus magindex_query_json(MagindexHandle *handle, const char *query_json,
                                    char **out_result_json, size_t *out_result_size);
 void magindex_free_string(char *value);

@@ -10,6 +10,7 @@
 #include <zlib.h>
 
 #include "types/color.h"
+#include "types/oracle_card.h"
 
 namespace {
     using json = nlohmann::json;
@@ -233,76 +234,92 @@ namespace {
         return result;
     }
 
-    Card ParseCard(const json &object) {
+    void ParseCard(const json &object, std::map<std::string, OracleCard>& OUTCards) {
         if (!object.is_object())
             throw std::runtime_error("Each JSONL record must be a card object");
 
-        Card card{};
-        card.id = RequiredString(object, "id");
+        OracleCard card{};
+        Printing cardPrinting;
+
+        OracleCard* TargetCard = &card;
+
         //The oracle id will always be present except for reversible_card layout. In that case there will be two found in card_faces
         card.OracleId = OptionalString(object, "oracle_id");
-        card.Name = RequiredString(object, "name");
-        card.Language = RequiredString(object, "lang");
-        card.Layout = OptionalString(object, "layout");
-        card.CardFaces = CardFaces(object);
-        card.cmc = OptionalCmc(object);
-        card.Colors = ParseColors(object, "colors");
-        card.ColorIdentity = ParseColors(object, "color_identity");
-        card.Layout = RequiredString(object, "layout");
-        card.Power = OptionalString(object, "power");
-        card.Toughness = OptionalString(object, "toughness");
-        card.Defense = OptionalString(object, "defense");
-        card.Loyalty = OptionalString(object, "loyalty");
-        card.ManaCost = OptionalString(object, "mana_cost");
-        card.Typeline = OptionalString(object, "type_line");
-        card.Keywords = StringArray(object, "keywords");
-        card.Legalities = Legalities(object);
-        card.ReleasedAt = RequiredDate(object, "released_at");
-        card.SmallImageURI = SmallImageUri(object);
-        card.NormalImageURI = NormalImageUri(object);
-        card.OracleText = OptionalString(object, "oracle_text");
-        card.Artist = OptionalString(object, "artist");
-        card.ArtistIds = StringArray(object, "artist_ids");
-        card.BorderColor = RequiredString(object, "border_color");
-        card.CollectorNumber = RequiredString(object, "collector_number");
-        card.bDigital = OptionalBool(object, "digital");
-        card.bFullArt = OptionalBool(object, "full_art");
-        card.bPromo = OptionalBool(object, "promo");
-        card.bReprint = OptionalBool(object, "reprint");
-        card.bOversized = OptionalBool(object, "oversized");
-        card.Finishes = StringArray(object, "finishes");
-        card.FlavorName = OptionalString(object, "flavor_name");
-        card.Frame = OptionalString(object, "frame");
-        card.FrameEffects = StringArray(object, "frame_effects");
-        card.SetId = OptionalString(object, "set_id");
-        card.SetCode = OptionalString(object, "set");
-        card.SetName = OptionalString(object, "set_name");
-        card.SetType = OptionalString(object, "set_type");
-        card.bTextless = OptionalBool(object, "textless");
-        card.Rarity = RequiredString(object, "rarity");
-        ParseTypes(object, card.SuperTypes, card.SubTypes);
+
+        card.Faces = CardFaces(object);
+
+        ParseFaces(object, card.Faces, cardPrinting.Faces);
 
         //Handle edge case where oracle id is not present in reversible_card layout
         if (card.OracleId.empty()) {
-            if (card.CardFaces.empty())
+            if (card.Faces.empty())
                 throw std::runtime_error("No oracle id given and card faces was empty");
-            card.OracleId = card.CardFaces[0].OracleId;
+            card.OracleId = card.Faces[0].OracleId;
         }
 
-        return card;
+        //If we have already parsed the card before, only update its printings
+        if (std::map<std::string, OracleCard>::iterator it = OUTCards.find(card.OracleId); it != OUTCards.end()) {
+            card.Name = RequiredString(object, "name");
+            card.Layout = OptionalString(object, "layout");
+            card.Cmc = OptionalCmc(object);
+            card.Colors = ParseColors(object, "colors");
+            card.ColorIdentity = ParseColors(object, "color_identity");
+            card.Layout = RequiredString(object, "layout");
+            card.Power = OptionalString(object, "power");
+            card.Toughness = OptionalString(object, "toughness");
+            card.Defense = OptionalString(object, "defense");
+            card.Loyalty = OptionalString(object, "loyalty");
+            card.ManaCost = OptionalString(object, "mana_cost");
+            card.Keywords = StringArray(object, "keywords");
+            card.Legalities = Legalities(object);
+            card.OracleText = OptionalString(object, "oracle_text");
+            ParseTypes(object, card.SuperTypes, card.SubTypes);
+        }else {
+            //If we already have a card object, use it and update its printings
+            TargetCard = &it->second;
+        }
+
+        cardPrinting.Id = RequiredString(object, "id");
+        cardPrinting.Language = RequiredString(object, "lang");
+        cardPrinting.CollectorNumber = RequiredString(object, "collector_number");
+        cardPrinting.FlavorName = OptionalString(object, "flavor_name");
+        cardPrinting.Artist = OptionalString(object, "artist");
+        cardPrinting.ArtistIds = StringArray(object, "artist_ids");
+        cardPrinting.BorderColor = RequiredString(object, "border_color");
+        cardPrinting.Digital = OptionalBool(object, "digital");
+        cardPrinting.Finishes = StringArray(object, "finishes");
+        cardPrinting.Frame = OptionalString(object, "frame");
+        cardPrinting.FrameEffects = StringArray(object, "frame_effects");
+        cardPrinting.PromoTypes = StringArray(object, "promo_types");
+        cardPrinting.FullArt = OptionalBool(object, "full_art");
+        cardPrinting.SmallImageURI = SmallImageUri(object);
+        cardPrinting.NormalImageURI = NormalImageUri(object);
+        cardPrinting.Oversized = OptionalBool(object, "oversized");
+        cardPrinting.Promo = OptionalBool(object, "promo");
+        cardPrinting.Rarity = RequiredString(object, "rarity");
+        cardPrinting.ReleasedAt = RequiredDate(object, "released_at");
+        cardPrinting.Reprint = OptionalBool(object, "reprint");
+        cardPrinting.SetId = OptionalString(object, "set_id");
+        cardPrinting.SetCode = OptionalString(object, "set");
+        cardPrinting.SetName = OptionalString(object, "set_name");
+        cardPrinting.SetType = OptionalString(object, "set_type");
+        cardPrinting.Textless = OptionalBool(object, "textless");
+        //TODO: PrintingFaces
+
+        TargetCard->Printings.push_back(cardPrinting);
     }
 
     void ParseLine(const std::filesystem::path &path,
                    std::size_t lineNumber,
                    std::string line,
-                   std::vector<Card> &cards) {
+                   std::set<OracleCard>& OUTCards) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
         if (line.empty())
             return;
 
         try {
-            cards.push_back(ParseCard(json::parse(line)));
+            ParseCard(json::parse(line), OUTCards);
         } catch (const std::exception &error) {
             throw std::runtime_error(path.string() + ": line " + std::to_string(lineNumber) + ": " + error.what());
         }
@@ -382,8 +399,7 @@ namespace {
 
 namespace magindex::processor {
 
-std::vector<Card> ScryfallProcessor::Process(std::filesystem::path file, UpdateType updateType,
-                                             const MagindexConfig &config) {
+std::vector<Card> ScryfallProcessor::Process(std::filesystem::path file, UpdateType updateType) {
     switch (updateType) {
         case UpdateType::None:
             return {};
