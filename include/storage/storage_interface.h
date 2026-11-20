@@ -6,6 +6,13 @@
 #include "types/oracle_card.h"
 
 namespace magindex::storage {
+
+    enum StoreType : uint8_t{
+        SetsReplacement,
+        CardReplacement,
+        TotalReplacement,
+    };
+
     template<typename T>
     class StorageBase {
     public:
@@ -15,9 +22,9 @@ namespace magindex::storage {
 
         /**
          * @param data The card data to be stored
-         * @param bOverrideExisting If we should replace cards that already exist in the storage. If false incoming cards that are already in the storage will be ignored.
+         * @param storeType What type of storing we are doing.
          */
-        virtual void Store(const T &data, bool bOverrideExisting) = 0;
+        virtual void Store(const T &data, StoreType storeType) = 0;
 
         /**
          * Drops all cards from our storage.

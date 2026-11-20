@@ -55,7 +55,6 @@ namespace magindex::types {
         bool Oversized = false;
         bool Promo = false;
         std::string Rarity;
-        std::chrono::year_month_day ReleasedAt;
         bool Reprint = false;
         std::string SetId;
         std::string SetCode;
@@ -86,6 +85,14 @@ namespace magindex::types {
         std::set<std::string> SubTypes;
         std::vector<OracleFace> Faces;
         std::vector<Printing> Printings;
+    };
+
+    struct OracleSet {
+        std::string Id;
+        std::string Code;
+        std::string Name;
+        std::chrono::year_month_day ReleasedAt;
+        std::string Type;
     };
 
     struct PageRequest {

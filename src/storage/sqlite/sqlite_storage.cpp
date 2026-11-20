@@ -19,6 +19,7 @@
 #include <string_view>
 #include <system_error>
 #include <variant>
+#include <ranges>
 
 using namespace magindex::types;
 
@@ -339,6 +340,7 @@ namespace magindex::storage {
         database.exec("PRAGMA foreign_keys = ON");
         database.exec("PRAGMA journal_mode = WAL");
         database.exec("PRAGMA busy_timeout = 5000");
+        database.exec("PRAGMA recursive_triggers = ON");
         CreateSchema(database);
     }
 
@@ -368,15 +370,33 @@ namespace magindex::storage {
 
     SQLiteStorage::~SQLiteStorage() = default;
 
-    void SQLiteStorage::Store(const CardChunk &cards, bool bOverrideExisting) {
-        if (cards.empty())
+    enum ConflictProtocol {
+        Ignore,
+        Throw,
+        Update,
+    };
+
+
+    std::string MakeConflictClause(StoreType storeType, const std::string& SetsReplacementValue, const std::string& TotalReplacementValue, const std::string& CardReplacementValue) {
+        switch (storeType) {
+            case SetsReplacement:
+                return SetsReplacementValue;
+            case TotalReplacement:
+                return TotalReplacementValue;
+            case CardReplacement:
+                return CardReplacementValue;
+            default:
+                throw std::invalid_argument("unhandled StoreType");
+        }
+    }
+
+    void SQLiteStorage::Store(const CardChunk &cardChunk, StoreType storeType) {
+        if (cardChunk.cards.empty())
             return;
 
         try {
             SQLite::Database &database = impl_->database;
             SQLite::Transaction transaction(database);
-
-            std::string conflictProtocol = bOverrideExisting ? "DO UPDATE SET" : "DO NOTHING";
 
             SQLite::Statement upsertCard(database, std::format(R"sql(
             INSERT INTO cards (
@@ -384,74 +404,31 @@ namespace magindex::storage {
                 type_line, power, power_numeric, toughness, toughness_numeric,
                 defense, defense_numeric, loyalty, loyalty_numeric, oracle_text
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(oracle_id) {}
-                name = excluded.name,
-                layout = excluded.layout,
-                mana_cost = excluded.mana_cost,
-                color_identity = excluded.color_identity,
-                colors = excluded.colors,
-                cmc = excluded.cmc,
-                type_line = excluded.type_line,
-                power = excluded.power,
-                power_numeric = excluded.power_numeric,
-                toughness = excluded.toughness,
-                toughness_numeric = excluded.toughness_numeric,
-                defense = excluded.defense,
-                defense_numeric = excluded.defense_numeric,
-                loyalty = excluded.loyalty,
-                loyalty_numeric = excluded.loyalty_numeric,
-                oracle_text = excluded.oracle_text
-        )sql", conflictProtocol));
+            {}
+        )sql", MakeConflictClause(storeType, "ON CONFLICT(oracle_id) DO NOTHING", "", "")));
+
             SQLite::Statement upsertSet(database, std::format(R"sql(
             INSERT INTO sets(set_id, code, name, released_at, set_type)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(set_id) {}
-                code = excluded.code,
-                name = excluded.name,
-                released_at = excluded.released_at,
-                set_type = excluded.set_type
-        )sql", conflictProtocol));
+            {}
+        )sql", MakeConflictClause(storeType, "","", "ON CONFLICT(set_id) DO NOTHING")));
+
             SQLite::Statement upsertPrinting(database, std::format(R"sql(
             INSERT INTO printings (
                 scryfall_id, oracle_id, set_id, lang, collector_number, flavor_name,
                 artist, frame, border_color, digital, full_art, oversized, promo,
                 textless, reprint, rarity, image_small, image_normal
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scryfall_id) {}
-                oracle_id = excluded.oracle_id,
-                set_id = excluded.set_id,
-                lang = excluded.lang,
-                collector_number = excluded.collector_number,
-                flavor_name = excluded.flavor_name,
-                artist = excluded.artist,
-                frame = excluded.frame,
-                border_color = excluded.border_color,
-                digital = excluded.digital,
-                full_art = excluded.full_art,
-                oversized = excluded.oversized,
-                promo = excluded.promo,
-                textless = excluded.textless,
-                reprint = excluded.reprint,
-                rarity = excluded.rarity,
-                image_small = excluded.image_small,
-                image_normal = excluded.image_normal
-        )sql", conflictProtocol));
-
-            SQLite::Statement deleteFaces(database, "DELETE FROM card_faces WHERE card_id = ?");
-            SQLite::Statement deleteKeywords(database, "DELETE FROM keywords WHERE card_id = ?");
-            SQLite::Statement deleteLegalities(database, "DELETE FROM legalities WHERE card_id = ?");
-            SQLite::Statement deleteFinishes(database, "DELETE FROM finishes WHERE printing_id = ?");
-            SQLite::Statement deletePrintingFaces(database, "DELETE FROM printing_faces WHERE printing_id = ?");
-            SQLite::Statement deleteFrameEffects(database, "DELETE FROM frame_effects WHERE printing_id = ?");
-            SQLite::Statement deleteArtistIds(database, "DELETE FROM artist_ids WHERE printing_id = ?");
+        )sql"));
 
             SQLite::Statement insertFace(database, R"sql(
             INSERT OR IGNORE INTO card_faces (
-                card_id, ordinal, name, artist, artist_id, colors, cmc, mana_cost,
+                card_id, ordinal, name, colors, cmc, mana_cost,
                 defense, defense_numeric, power, power_numeric, toughness,
-                toughness_numeric, loyalty, loyalty_numeric, type_line, image_small, image_normal
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                toughness_numeric, loyalty, loyalty_numeric, type_line,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         )sql");
+
             SQLite::Statement upsertPrintingFace(database, R"sql(
                 INSERT INTO printing_faces(printing_id, ordinal, name, artist, artist_id, image_small, image_normal)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -477,15 +454,56 @@ namespace magindex::storage {
             SQLite::Statement insertSubtype(
                 database, "INSERT OR IGNORE INTO subtypes(card_id, subtype) VALUES (?, ?)");
 
-            for (const Card &card: cards) {
-                if (card.id.empty() || card.OracleId.empty() || card.Name.empty())
-                    throw std::invalid_argument("Cannot store a card with an empty printing ID, oracle ID, or name");
-                if (card.SetId.empty() || card.SetCode.empty() || card.SetName.empty() || card.SetType.empty())
-                    throw std::invalid_argument("Cannot store a card with incomplete set metadata");
-                if (card.CollectorNumber.empty() || card.Rarity.empty())
-                    throw std::invalid_argument("Cannot store a printing without collector number and rarity");
 
-                const std::string releasedAt = FormatDate(card.ReleasedAt);
+            SQLite::Statement deleteCard(database, "DELETE FROM cards WHERE card_id = ?");
+            SQLite::Statement deleteFaces(database, "DELETE FROM card_faces WHERE card_id = ?");
+            SQLite::Statement deleteKeywords(database, "DELETE FROM keywords WHERE card_id = ?");
+            SQLite::Statement deleteLegalities(database, "DELETE FROM legalities WHERE card_id = ?");
+            SQLite::Statement deleteFinishes(database, "DELETE FROM finishes WHERE printing_id = ?");
+            SQLite::Statement deletePrintingFaces(database, "DELETE FROM printing_faces WHERE printing_id = ?");
+            SQLite::Statement deleteFrameEffects(database, "DELETE FROM frame_effects WHERE printing_id = ?");
+            SQLite::Statement deleteArtistIds(database, "DELETE FROM artist_ids WHERE printing_id = ?");
+            SQLite::Statement deletePrintingsFromSet(database, "DELETE FROM printings WHERE set_id = ?");
+            SQLite::Statement deleteSet(database, "DELETE FROM sets WHERE set_id = ?");
+
+            if (storeType == TotalReplacement) {
+                EmptyStorage();
+            }
+
+            for (const OracleSet& set : cardChunk.Sets | std::views::values) {
+                if (storeType == SetsReplacement) {
+                    //Delete all printings with our sets.
+                    deletePrintingsFromSet.bind(1, set.Id);
+                    deletePrintingsFromSet.exec();
+                    deletePrintingsFromSet.reset();
+
+                    //Delete the set that we have already
+                    deleteSet.bind(1, set.Id);
+                    deleteSet.exec();
+                    deleteSet.reset();
+                }
+
+                upsertSet.bind(1, set.Id);
+                upsertSet.bind(2, set.Code);
+                upsertSet.bind(3, set.Name);
+                upsertSet.bind(4, FormatDate(set.ReleasedAt));
+                upsertSet.bind(5, set.Type);
+                upsertSet.exec();
+                Reset(upsertSet);
+            }
+
+            for (const OracleCard & card: cardChunk.cards | std::views::values) {
+
+                if (card.OracleId.empty() || card.Name.empty())
+                    throw std::invalid_argument("Cannot store a card with an empty printing ID, oracle ID, or name");
+
+                if (storeType == CardReplacement) {
+                    //Delete each card before inserting. We delete instead of updating in order to trigger cascades
+                    deleteCard.bind(1, card.OracleId);
+                    deleteCard.exec();
+                    deleteCard.reset();
+                }
+
 
                 upsertCard.bind(1, card.OracleId);
                 upsertCard.bind(2, card.Name);
@@ -493,8 +511,8 @@ namespace magindex::storage {
                 upsertCard.bind(4, card.ManaCost);
                 upsertCard.bind(5, static_cast<int>(card.ColorIdentity));
                 upsertCard.bind(6, static_cast<int>(card.Colors));
-                upsertCard.bind(7, static_cast<double>(card.cmc));
-                upsertCard.bind(8, card.Typeline);
+                upsertCard.bind(7, static_cast<double>(card.Cmc));
+                upsertCard.bind(8, card.TypeLine);
                 BindNullableText(upsertCard, 9, card.Power);
                 BindNullableNumeric(upsertCard, 10, card.Power);
                 BindNullableText(upsertCard, 11, card.Toughness);
@@ -507,138 +525,6 @@ namespace magindex::storage {
                 upsertCard.exec();
                 Reset(upsertCard);
 
-                // deleteFaces.bind(1, card.OracleId);
-                // deleteFaces.exec();
-                // Reset(deleteFaces);
-                // deleteKeywords.bind(1, card.OracleId);
-                // deleteKeywords.exec();
-                // Reset(deleteKeywords);
-                // deleteLegalities.bind(1, card.OracleId);
-                // deleteLegalities.exec();
-                // Reset(deleteLegalities);
-
-                for (const CardFace &face: card.CardFaces) {
-                    if (face.Name.empty())
-                        throw std::invalid_argument("Cannot store a card face with an empty name");
-
-                    insertFace.bind(1, card.OracleId);
-                    insertFace.bind(2, static_cast<int>(face.Ordinal));
-                    insertFace.bind(3, face.Name);
-                    BindNullableText(insertFace, 4, face.Artist);
-                    BindNullableText(insertFace, 5, face.ArtistId);
-                    insertFace.bind(6, static_cast<int>(face.Colors));
-                    insertFace.bind(7, static_cast<double>(face.Cmc));
-                    BindNullableText(insertFace, 8, face.ManaCost);
-                    BindNullableText(insertFace, 9, face.Defense);
-                    BindNullableNumeric(insertFace, 10, face.Defense);
-                    BindNullableText(insertFace, 11, face.Power);
-                    BindNullableNumeric(insertFace, 12, face.Power);
-                    BindNullableText(insertFace, 13, face.Toughness);
-                    BindNullableNumeric(insertFace, 14, face.Toughness);
-                    BindNullableText(insertFace, 15, face.Loyalty);
-                    BindNullableNumeric(insertFace, 16, face.Loyalty);
-                    BindNullableText(insertFace, 17, face.TypeLine);
-                    BindNullableText(insertFace, 18, face.SmallImageURI);
-                    BindNullableText(insertFace, 19, face.NormalImageURI);
-                    insertFace.exec();
-                    Reset(insertFace);
-                }
-
-                for (const auto &[format, legality]: card.Legalities) {
-                    insertLegality.bind(1, card.OracleId);
-                    insertLegality.bind(2, format);
-                    insertLegality.bind(3, legality);
-                    insertLegality.exec();
-                    Reset(insertLegality);
-                }
-
-                for (const std::string &keyword: card.Keywords) {
-                    if (keyword.empty())
-                        continue;
-                    insertKeyword.bind(1, card.OracleId);
-                    insertKeyword.bind(2, keyword);
-                    insertKeyword.exec();
-                    Reset(insertKeyword);
-                }
-
-                upsertSet.bind(1, card.SetId);
-                upsertSet.bind(2, card.SetCode);
-                upsertSet.bind(3, card.SetName);
-                upsertSet.bind(4, releasedAt);
-                upsertSet.bind(5, card.SetType);
-                upsertSet.exec();
-                Reset(upsertSet);
-
-                upsertPrinting.bind(1, card.id);
-                upsertPrinting.bind(2, card.OracleId);
-                upsertPrinting.bind(3, card.SetId);
-                upsertPrinting.bind(4, card.Language);
-                upsertPrinting.bind(5, card.CollectorNumber);
-                BindNullableText(upsertPrinting, 6, card.FlavorName);
-                BindNullableText(upsertPrinting, 7, card.Artist);
-                BindNullableText(upsertPrinting, 8, card.Frame);
-                BindNullableText(upsertPrinting, 9, card.BorderColor);
-                upsertPrinting.bind(10, card.bDigital ? 1 : 0);
-                upsertPrinting.bind(11, card.bFullArt ? 1 : 0);
-                upsertPrinting.bind(12, card.bOversized ? 1 : 0);
-                upsertPrinting.bind(13, card.bPromo ? 1 : 0);
-                upsertPrinting.bind(14, card.bTextless ? 1 : 0);
-                upsertPrinting.bind(15, card.bReprint ? 1 : 0);
-                upsertPrinting.bind(16, card.Rarity);
-                BindNullableText(upsertPrinting, 17, card.SmallImageURI);
-                BindNullableText(upsertPrinting, 18, card.NormalImageURI);
-                upsertPrinting.exec();
-                Reset(upsertPrinting);
-
-                deletePrintingFaces.bind(1, card.id);
-                deletePrintingFaces.exec();
-                Reset(deletePrintingFaces);
-                for (const CardFace &face : card.CardFaces) {
-                    upsertPrintingFace.bind(1, card.id);
-                    upsertPrintingFace.bind(2, static_cast<int>(face.Ordinal));
-                    upsertPrintingFace.bind(3, face.Name);
-                    BindNullableText(upsertPrintingFace, 4, face.Artist);
-                    BindNullableText(upsertPrintingFace, 5, face.ArtistId);
-                    BindNullableText(upsertPrintingFace, 6, face.SmallImageURI);
-                    BindNullableText(upsertPrintingFace, 7, face.NormalImageURI);
-                    upsertPrintingFace.exec();
-                    Reset(upsertPrintingFace);
-                }
-
-                // deleteFinishes.bind(1, card.id);
-                // deleteFinishes.exec();
-                // Reset(deleteFinishes);
-                // deleteFrameEffects.bind(1, card.id);
-                // deleteFrameEffects.exec();
-                // Reset(deleteFrameEffects);
-                // deleteArtistIds.bind(1, card.id);
-                // deleteArtistIds.exec();
-                // Reset(deleteArtistIds);
-
-                for (const std::string &finish: card.Finishes) {
-                    insertFinish.bind(1, card.id);
-                    insertFinish.bind(2, finish);
-                    insertFinish.exec();
-                    Reset(insertFinish);
-                }
-                for (const std::string &effect: card.FrameEffects) {
-                    insertFrameEffect.bind(1, card.id);
-                    insertFrameEffect.bind(2, effect);
-                    insertFrameEffect.exec();
-                    Reset(insertFrameEffect);
-                }
-                for (const std::string &artistId: card.ArtistIds) {
-                    insertArtistId.bind(1, card.id);
-                    insertArtistId.bind(2, artistId);
-                    insertArtistId.exec();
-                    Reset(insertArtistId);
-                }
-                for (const std::string &promoType: card.PromoTypes) {
-                    insertPromoType.bind(1, card.id);
-                    insertPromoType.bind(2, promoType);
-                    insertPromoType.exec();
-                    Reset(insertPromoType);
-                }
                 for (const std::string &supertype: card.SuperTypes) {
                     insertSupertype.bind(1, card.OracleId);
                     insertSupertype.bind(2, supertype);
@@ -650,6 +536,111 @@ namespace magindex::storage {
                     insertSubtype.bind(2, subtype);
                     insertSubtype.exec();
                     Reset(insertSubtype);
+                }
+                for (const auto &[format, legality]: card.Legalities) {
+                    insertLegality.bind(1, card.OracleId);
+                    insertLegality.bind(2, format);
+                    insertLegality.bind(3, legality);
+                    insertLegality.exec();
+                    Reset(insertLegality);
+                }
+                for (const std::string &keyword: card.Keywords) {
+                    if (keyword.empty())
+                        continue;
+                    insertKeyword.bind(1, card.OracleId);
+                    insertKeyword.bind(2, keyword);
+                    insertKeyword.exec();
+                    Reset(insertKeyword);
+                }
+
+                for (const OracleFace &face: card.Faces) {
+                    if (face.Name.empty())
+                        throw std::invalid_argument("Cannot store a card face with an empty name");
+
+                    insertFace.bind(1, card.OracleId);
+                    insertFace.bind(2, static_cast<int>(face.Ordinal));
+                    insertFace.bind(3, face.Name);
+                    insertFace.bind(4, static_cast<int>(face.Colors));
+                    insertFace.bind(5, static_cast<double>(face.Cmc));
+                    BindNullableText(insertFace, 6, face.ManaCost);
+                    BindNullableText(insertFace, 7, face.Defense);
+                    BindNullableNumeric(insertFace, 8, face.Defense);
+                    BindNullableText(insertFace, 9, face.Power);
+                    BindNullableNumeric(insertFace, 10, face.Power);
+                    BindNullableText(insertFace, 11, face.Toughness);
+                    BindNullableNumeric(insertFace, 12, face.Toughness);
+                    BindNullableText(insertFace, 13, face.Loyalty);
+                    BindNullableNumeric(insertFace, 14, face.Loyalty);
+                    BindNullableText(insertFace, 15, face.TypeLine);
+
+                    insertFace.exec();
+                    Reset(insertFace);
+                }
+
+                for (const Printing& printing : card.Printings) {
+                    if (printing.SetId.empty() || printing.SetCode.empty() || printing.SetName.empty() || printing.SetType.empty())
+                        throw std::invalid_argument("Cannot store a card with incomplete set metadata");
+                    if (printing.CollectorNumber.empty() || printing.Rarity.empty())
+                        throw std::invalid_argument("Cannot store a printing without collector number and rarity");
+
+                    upsertPrinting.bind(1, printing.Id);
+                    upsertPrinting.bind(2, card.OracleId);
+                    upsertPrinting.bind(3, printing.SetId);
+                    upsertPrinting.bind(4, printing.Language);
+                    upsertPrinting.bind(5, printing.CollectorNumber);
+                    BindNullableText(upsertPrinting, 6, printing.FlavorName);
+                    BindNullableText(upsertPrinting, 7, printing.Artist);
+                    BindNullableText(upsertPrinting, 8, printing.Frame);
+                    BindNullableText(upsertPrinting, 9, printing.BorderColor);
+                    upsertPrinting.bind(10, printing.Digital ? 1 : 0);
+                    upsertPrinting.bind(11, printing.FullArt ? 1 : 0);
+                    upsertPrinting.bind(12, printing.Oversized ? 1 : 0);
+                    upsertPrinting.bind(13, printing.Promo ? 1 : 0);
+                    upsertPrinting.bind(14, printing.Textless ? 1 : 0);
+                    upsertPrinting.bind(15, printing.Reprint ? 1 : 0);
+                    upsertPrinting.bind(16, printing.Rarity);
+                    BindNullableText(upsertPrinting, 17, printing.SmallImageURI);
+                    BindNullableText(upsertPrinting, 18, printing.NormalImageURI);
+                    upsertPrinting.exec();
+                    Reset(upsertPrinting);
+
+                    for (const std::string &finish: printing.Finishes) {
+                        insertFinish.bind(1, printing.Id);
+                        insertFinish.bind(2, finish);
+                        insertFinish.exec();
+                        Reset(insertFinish);
+                    }
+                    for (const std::string &effect: printing.FrameEffects) {
+                        insertFrameEffect.bind(1, printing.Id);
+                        insertFrameEffect.bind(2, effect);
+                        insertFrameEffect.exec();
+                        Reset(insertFrameEffect);
+                    }
+                    for (const std::string &artistId: printing.ArtistIds) {
+                        insertArtistId.bind(1, printing.Id);
+                        insertArtistId.bind(2, artistId);
+                        insertArtistId.exec();
+                        Reset(insertArtistId);
+                    }
+                    for (const std::string &promoType: printing.PromoTypes) {
+                        insertPromoType.bind(1, printing.Id);
+                        insertPromoType.bind(2, promoType);
+                        insertPromoType.exec();
+                        Reset(insertPromoType);
+                    }
+
+                    for (const PrintingFace& face : printing) {
+                        upsertPrintingFace.bind(1, printing.Id);
+                        upsertPrintingFace.bind(2, static_cast<int>(face.Ordinal));
+                        upsertPrintingFace.bind(3, face.Name);
+                        BindNullableText(upsertPrintingFace, 4, face.Artist);
+                        BindNullableText(upsertPrintingFace, 5, face.ArtistId);
+                        BindNullableText(upsertPrintingFace, 6, face.SmallImageURI);
+                        BindNullableText(upsertPrintingFace, 7, face.NormalImageURI);
+
+                        upsertPrintingFace.exec();
+                        Reset(insertFace);
+                    }
                 }
             }
 
@@ -866,21 +857,31 @@ namespace magindex::storage {
                 while(printsStmt.executeStep()) {
                     auto pc=[&](int i){return printsStmt.getColumn(i);};
                     types::Printing p;
-                    p.Id=pc(0).getString(); p.Language=pc(1).getString(); p.CollectorNumber=pc(2).getString();
-                    p.FlavorName=pc(3).getString(); p.Artist=pc(4).getString(); p.Frame=pc(5).getString();
-                    p.BorderColor=pc(6).getString(); p.Digital=pc(7).getInt()!=0; p.FullArt=pc(8).getInt()!=0;
-                    p.Oversized=pc(9).getInt()!=0; p.Promo=pc(10).getInt()!=0; p.Textless=pc(11).getInt()!=0;
-                    p.Reprint=pc(12).getInt()!=0; p.Rarity=pc(13).getString(); p.SmallImageURI=pc(14).getString();
-                    p.NormalImageURI=pc(15).getString(); p.SetId=pc(16).getString(); p.SetCode=pc(17).getString();
-                    p.SetName=pc(18).getString(); p.SetType=pc(19).getString();
-                    const std::string date=pc(20).getString();
-                    if(date.size()==10) p.ReleasedAt=std::chrono::year{std::stoi(date.substr(0,4))} /
-                        std::chrono::month{static_cast<unsigned>(std::stoi(date.substr(5,2)))} /
-                        std::chrono::day{static_cast<unsigned>(std::stoi(date.substr(8,2)))};
+                    p.Id=pc(0).getString();
+                    p.Language=pc(1).getString();
+                    p.CollectorNumber=pc(2).getString();
+                    p.FlavorName=pc(3).getString();
+                    p.Artist=pc(4).getString();
+                    p.Frame=pc(5).getString();
+                    p.BorderColor=pc(6).getString();
+                    p.Digital=pc(7).getInt()!=0;
+                    p.FullArt=pc(8).getInt()!=0;
+                    p.Oversized=pc(9).getInt()!=0;
+                    p.Promo=pc(10).getInt()!=0;
+                    p.Textless=pc(11).getInt()!=0;
+                    p.Reprint=pc(12).getInt()!=0;
+                    p.Rarity=pc(13).getString();
+                    p.SmallImageURI=pc(14).getString();
+                    p.NormalImageURI=pc(15).getString();
+                    p.SetId=pc(16).getString();
+                    p.SetCode=pc(17).getString();
+                    p.SetName=pc(18).getString();
+                    p.SetType=pc(19).getString();
+
                     loadStrings(finishesStmt,p.Id,[&](std::string v){p.Finishes.push_back(std::move(v));});
                     loadStrings(effectsStmt,p.Id,[&](std::string v){p.FrameEffects.push_back(std::move(v));});
                     loadStrings(artistIdsStmt,p.Id,[&](std::string v){p.ArtistIds.push_back(std::move(v));});
-                    loadStrings(promoStmt,p.Id,[&](std::string v){p.PromoTypes.insert(std::move(v));});
+                    loadStrings(promoStmt,p.Id,[&](std::string v){p.PromoTypes.push_back(std::move(v));});
                     printingFacesStmt.bind(1,p.Id);
                     while(printingFacesStmt.executeStep()) {
                         auto fc=[&](int i){return printingFacesStmt.getColumn(i);};

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "types/card.h"
+#include "types/oracle_card.h"
 #include "types/update_type.h"
 
 namespace magindex::processor {
@@ -21,7 +22,7 @@ namespace magindex::processor {
          * @param path The path to process
          * @param updateType The update type of the download. Useful for determining how to process the file(s)
          */
-        virtual std::vector<types::Card> Process(std::filesystem::path path, UpdateType updateType) =
+        virtual std::map<std::string, types::OracleCard> Process(std::filesystem::path path, UpdateType updateType) =
         0;
     };
 }
