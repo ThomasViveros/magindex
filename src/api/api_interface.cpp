@@ -208,13 +208,7 @@ namespace {
                 {"artist_id", face.ArtistId}, {"image_small", face.SmallImageURI},
                 {"image_normal", face.NormalImageURI}});
         }
-        const auto date = printing.ReleasedAt;
-        std::string releasedAt;
-        if (date.ok()) {
-            releasedAt = std::to_string(static_cast<int>(date.year())) + "-" +
-                (static_cast<unsigned>(date.month()) < 10 ? "0" : "") + std::to_string(static_cast<unsigned>(date.month())) + "-" +
-                (static_cast<unsigned>(date.day()) < 10 ? "0" : "") + std::to_string(static_cast<unsigned>(date.day()));
-        }
+
         return {{"id", printing.Id}, {"language", printing.Language},
             {"collector_number", printing.CollectorNumber}, {"flavor_name", printing.FlavorName},
             {"artist", printing.Artist}, {"artist_ids", printing.ArtistIds}, {"border_color", printing.BorderColor},
@@ -222,7 +216,7 @@ namespace {
             {"frame_effects", printing.FrameEffects}, {"promo_types", printing.PromoTypes},
             {"full_art", printing.FullArt}, {"image_small", printing.SmallImageURI},
             {"image_normal", printing.NormalImageURI}, {"oversized", printing.Oversized},
-            {"promo", printing.Promo}, {"rarity", printing.Rarity}, {"released_at", releasedAt},
+            {"promo", printing.Promo}, {"rarity", printing.Rarity},
             {"reprint", printing.Reprint}, {"set_id", printing.SetId}, {"set_code", printing.SetCode},
             {"set_name", printing.SetName}, {"set_type", printing.SetType},
             {"textless", printing.Textless}, {"faces", std::move(faces)}};
@@ -279,9 +273,9 @@ namespace magindex::api {
         impl_->storage.GetAllTrackedSets(OUTTrackedSets);
     }
 
-    void Context::StoreCards(const std::vector<types::Card> &Cards) {
+    void Context::StoreCards(const storage::CardChunk& CardChunk, storage::StoreType storeType) {
         std::lock_guard lock(impl_->mutex);
-        impl_->storage.Store(Cards);
+        impl_->storage.Store(CardChunk, storeType);
     }
 
     void Context::Clear() {
@@ -341,9 +335,33 @@ MagindexStatus magindex_update(MagindexHandle* handle, const char *ignore_set_ty
 
         magindex::processor::ScryfallProcessor processor;
 
-        std::vector<Card> processedCards = processor.Process(importResult.InstallFilePath, importResult.UpdateType);
+        if (importResult.UpdateType == UpdateType::None) {
+            //We were up to date
+            return MAGINDEX_STATUS_OK;
+        }
 
-        handle->context.StoreCards(processedCards);
+        std::set<std::string> targetSets;
+        magindex::storage::StoreType storeType = magindex::storage::NA;
+
+        switch (importResult.UpdateType) {
+            case UpdateType::None:
+                return MAGINDEX_STATUS_OK;
+            case UpdateType::IncrementalUsingBulk:
+                targetSets = importResult.TargetSets;
+                storeType = magindex::storage::SetsReplacement;
+                break;
+            case UpdateType::Incremental:
+                storeType = magindex::storage::SetsReplacement;
+                break;
+            case UpdateType::TotalBulk:
+                storeType = magindex::storage::TotalReplacement;
+                break;
+        }
+
+        magindex::storage::CardChunk cardChunk;
+        processor.Process(importResult.InstallFilePath, targetSets, cardChunk.cards, cardChunk.Sets);
+
+        handle->context.StoreCards(cardChunk, storeType);
 
         return MAGINDEX_STATUS_OK;
     }catch (...) {

@@ -8,6 +8,7 @@
 namespace magindex::storage {
 
     enum StoreType : uint8_t{
+        NA,
         SetsReplacement,
         CardReplacement,
         TotalReplacement,

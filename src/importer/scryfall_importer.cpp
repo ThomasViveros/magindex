@@ -542,30 +542,6 @@ namespace magindex::importer {
         LogInfo("Received set metadata");
     }
 
-
-    ImportResult
-    ScryfallImporter::ImportCardsForInitialization(const std::filesystem::path& directory, std::chrono::sys_time<std::chrono::days> LastUpdated) {
-        ImportResult importResult;
-
-        BulkMetadata bulkMetadata = GetBulkMetadata();
-
-        constexpr const char *bulkDataFileName = "bulk-data.jsonl.gz";
-
-        if (LastUpdated >= parseTimestamp(bulkMetadata.updated_at)) {
-            LogInfo("Bulk card data is already current");
-            importResult.UpdateType = UpdateType::None;
-            return importResult;
-        }
-
-        importResult.InstallFilePath = directory / bulkDataFileName;
-        GetBulkData(bulkMetadata.jsonl_download_uri, importResult.InstallFilePath);
-
-        importResult.UpdateType = UpdateType::TotalBulk;
-        LogInfo("Prepared full bulk card update");
-
-        return importResult;
-    }
-
     std::string buildSetQuery(const std::vector<std::string> &setCodes) {
         std::string query;
 
@@ -761,12 +737,9 @@ namespace magindex::importer {
     }
 
     ImportResult ScryfallImporter::ImportCardsForSetPatch(const std::vector<std::string>& Sets, const std::filesystem::path &directory) {
-
-        ImportResult importResult;
-
         constexpr const char *importFileName = "set_patch.jsonl";
 
-        importResult.InstallFilePath = directory / importFileName;
+        std::filesystem::path importFilePath = directory / importFileName;
 
         json OUTCards = json::array();
 
@@ -779,17 +752,15 @@ namespace magindex::importer {
 
         CrawlPages(curl.get(), url, OUTCards, std::nullopt);
 
-        SaveCardsInJson(importResult.InstallFilePath, OUTCards);
+        SaveCardsInJson(importFilePath, OUTCards);
 
-        return importResult;
+        return ImportResult{importFilePath, PatchSets{}};
     }
 
     ImportResult ScryfallImporter::ImportCardForPatch(const std::filesystem::path &directory, const std::string& cardName) {
-        ImportResult importResult;
-
         constexpr const char *importFileName = "card_patch.jsonl";
 
-        importResult.InstallFilePath = directory / importFileName;
+        std::filesystem::path importFilePath = directory / importFileName;
 
         json OUTCards = json::array();
 
@@ -802,23 +773,23 @@ namespace magindex::importer {
 
         CrawlPages(curl.get(), url, OUTCards, std::nullopt);
 
-        SaveCardsInJson(importResult.InstallFilePath, OUTCards);
+        SaveCardsInJson(importFilePath, OUTCards);
 
-        return importResult;
+        return ImportResult{importFilePath, PatchCards{}};
     }
 
     ImportResult ScryfallImporter::ImportCardsForUpdate(const std::filesystem::path& directory,
         const std::map<std::string, uint64_t>& TrackedSets,
         const std::set<std::string>& SetTypesToIgnore) {
 
-        ImportResult importResult;
-
         std::vector<SetMetadata> setMetadata;
         GetSetMetadata(setMetadata);
 
         constexpr const char *importFileName = "incremental_update.jsonl";
+        constexpr const char *bulkDataFileName = "bulk-data.jsonl.gz";
 
-        importResult.InstallFilePath = directory / importFileName;
+        std::filesystem::path importFilePath = directory / importFileName;
+        std::filesystem::path bulkImportFilepath = directory / bulkDataFileName;
 
         std::vector<std::string> setsToUpdate;
 
@@ -842,8 +813,17 @@ namespace magindex::importer {
         if (setsToUpdate.empty()) {
             //We are all up to date
             LogInfo("No sets need an incremental update");
-            importResult.UpdateType = UpdateType::None;
-            return importResult;
+            return ImportResult(NoUpdate{});
+        }
+
+        //If we have to update all sets, do a total reset
+        if (setsToUpdate.size() == setMetadata.size()) {
+            LogInfo("All sets need updating, switching to total reset");
+
+            BulkMetadata bulkMetadata = GetBulkMetadata();
+            GetBulkData(bulkMetadata.jsonl_download_uri, bulkImportFilepath);
+
+            return ImportResult{bulkImportFilepath, TotalReset{}};
         }
 
         LogInfo("Found " + std::to_string(setsToUpdate.size()) + " sets to update");
@@ -859,22 +839,23 @@ namespace magindex::importer {
         if (!CrawlPages(curl.get(), url,allCards ,MAX_CARD_COUNT_FOR_INCREMENTAL_UPDATE)) {
             //Switch to bulk update.
             LogInfo("Incremental result exceeds threshold; switching to bulk update");
-            importResult.UpdateType = UpdateType::IncrementalUsingBulk;
-            return importResult;
+
+            BulkMetadata bulkMetadata = GetBulkMetadata();
+            GetBulkData(bulkMetadata.jsonl_download_uri, bulkImportFilepath);
+
+            return ImportResult(bulkImportFilepath, PatchSets{setsToUpdate});
         }
 
         if (allCards.empty()) {
             //We didnt get any cards. Scryfall potentially listed new sets with no leaked cards
             LogInfo("No cards returned for the selected sets");
-            importResult.UpdateType = UpdateType::None;
-            return importResult;
+            return ImportResult{NoUpdate{}};
         }
 
-        SaveCardsInJson(importResult.InstallFilePath, allCards);
+        SaveCardsInJson(importFilePath, allCards);
 
-        importResult.UpdateType = UpdateType::Incremental;
         LogInfo("Prepared incremental update with " + std::to_string(allCards.size()) + " cards");
 
-        return importResult;
+        return ImportResult{importFilePath, PatchSets{}};
     }
 }

@@ -2,17 +2,51 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <variant>
 
 #include "types/magindex_config.h"
 #include "types/update_type.h"
 
 
 namespace magindex::importer {
+
+    struct NoUpdate{};
+
+    struct PatchSets {
+        //Assign this when using a bulk file to patch sets.
+        std::optional<std::vector<std::string>> SetsToPatchFromBulkFile;
+    };
+    struct PatchCards{};
+    struct TotalReset{};
+
     struct ImportResult {
+
+        ImportResult() = delete;
+
+        ImportResult(NoUpdate noUpdate) {
+            UpdateType = UpdateType::None;
+        }
+
+        ImportResult(const std::filesystem::path& InPath, PatchSets patch) {
+            InstallFilePath = InPath;
+            ImportVariant = patch;
+        }
+        ImportResult(const std::filesystem::path& InPath, PatchCards patch) {
+            InstallFilePath = InPath;
+            ImportVariant = patch;
+        }
+        ImportResult(const std::filesystem::path& InPath, TotalReset totalReset) {
+            InstallFilePath = InPath;
+            ImportVariant = totalReset;
+        }
+
+
         UpdateType UpdateType = UpdateType::None;
 
         //May be empty
         std::filesystem::path InstallFilePath;
+
+        std::variant<NoUpdate, PatchSets, PatchCards, TotalReset> ImportVariant;
     };
 
     class ImporterBase {

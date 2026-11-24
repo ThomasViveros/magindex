@@ -205,8 +205,6 @@ namespace {
                 card_id TEXT NOT NULL REFERENCES cards(oracle_id) ON DELETE CASCADE,
                 ordinal INTEGER NOT NULL,
                 name TEXT NOT NULL,
-                artist TEXT NULL,
-                artist_id TEXT NULL,
                 colors INTEGER NOT NULL DEFAULT 0,
                 cmc FLOAT NULL,
                 mana_cost TEXT NULL,
@@ -219,9 +217,27 @@ namespace {
                 loyalty TEXT NULL,
                 loyalty_numeric REAL NULL,
                 type_line TEXT NULL,
-                image_small TEXT NULL,
-                image_normal TEXT NULL,
                 PRIMARY KEY (card_id, ordinal)
+            ) WITHOUT ROWID
+        )sql");
+
+        database.exec(R"sql(
+            CREATE TABLE IF NOT EXISTS oracle_face_supertypes (
+                card_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                supertype TEXT NOT NULL,
+                PRIMARY KEY (card_id, ordinal, supertype),
+                FOREIGN KEY (card_id, ordinal) REFERENCES card_faces(card_id, ordinal) ON DELETE CASCADE
+            ) WITHOUT ROWID
+        )sql");
+
+        database.exec(R"sql(
+            CREATE TABLE IF NOT EXISTS oracle_face_subtypes (
+                card_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                subtype TEXT NOT NULL,
+                PRIMARY KEY (card_id, ordinal, subtype),
+                FOREIGN KEY (card_id, ordinal) REFERENCES card_faces(card_id, ordinal) ON DELETE CASCADE
             ) WITHOUT ROWID
         )sql");
 
@@ -319,6 +335,8 @@ namespace {
         database.exec("CREATE INDEX IF NOT EXISTS idx_card_faces_toughness ON card_faces(toughness_numeric)");
         database.exec("CREATE INDEX IF NOT EXISTS idx_card_faces_loyalty ON card_faces(loyalty_numeric)");
         database.exec("CREATE INDEX IF NOT EXISTS idx_card_faces_defense ON card_faces(defense_numeric)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_oracle_face_supertypes_value ON oracle_face_supertypes(supertype, card_id)");
+        database.exec("CREATE INDEX IF NOT EXISTS idx_oracle_face_subtypes_value ON oracle_face_subtypes(subtype, card_id)");
 
         database.exec("CREATE INDEX IF NOT EXISTS idx_printings_flavor_name ON printings(flavor_name)");
         database.exec("CREATE INDEX IF NOT EXISTS idx_printings_oracle_id ON printings(oracle_id)");
@@ -370,48 +388,40 @@ namespace magindex::storage {
 
     SQLiteStorage::~SQLiteStorage() = default;
 
-    enum ConflictProtocol {
-        Ignore,
-        Throw,
-        Update,
-    };
-
-
-    std::string MakeConflictClause(StoreType storeType, const std::string& SetsReplacementValue, const std::string& TotalReplacementValue, const std::string& CardReplacementValue) {
-        switch (storeType) {
-            case SetsReplacement:
-                return SetsReplacementValue;
-            case TotalReplacement:
-                return TotalReplacementValue;
-            case CardReplacement:
-                return CardReplacementValue;
-            default:
-                throw std::invalid_argument("unhandled StoreType");
-        }
-    }
-
     void SQLiteStorage::Store(const CardChunk &cardChunk, StoreType storeType) {
-        if (cardChunk.cards.empty())
+        if (cardChunk.cards.empty() && cardChunk.Sets.empty() && storeType != TotalReplacement)
             return;
 
         try {
             SQLite::Database &database = impl_->database;
             SQLite::Transaction transaction(database);
+            if (storeType == TotalReplacement) {
+                database.exec("DELETE FROM cards");
+                database.exec("DELETE FROM sets");
+            }
 
-            SQLite::Statement upsertCard(database, std::format(R"sql(
+            SQLite::Statement upsertCard(database, R"sql(
             INSERT INTO cards (
                 oracle_id, name, layout, mana_cost, color_identity, colors, cmc,
                 type_line, power, power_numeric, toughness, toughness_numeric,
                 defense, defense_numeric, loyalty, loyalty_numeric, oracle_text
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            {}
-        )sql", MakeConflictClause(storeType, "ON CONFLICT(oracle_id) DO NOTHING", "", "")));
+            ON CONFLICT(oracle_id) DO UPDATE SET
+                name=excluded.name, layout=excluded.layout, mana_cost=excluded.mana_cost,
+                color_identity=excluded.color_identity, colors=excluded.colors, cmc=excluded.cmc,
+                type_line=excluded.type_line, power=excluded.power, power_numeric=excluded.power_numeric,
+                toughness=excluded.toughness, toughness_numeric=excluded.toughness_numeric,
+                defense=excluded.defense, defense_numeric=excluded.defense_numeric,
+                loyalty=excluded.loyalty, loyalty_numeric=excluded.loyalty_numeric,
+                oracle_text=excluded.oracle_text
+        )sql");
 
-            SQLite::Statement upsertSet(database, std::format(R"sql(
+            SQLite::Statement upsertSet(database, R"sql(
             INSERT INTO sets(set_id, code, name, released_at, set_type)
             VALUES (?, ?, ?, ?, ?)
-            {}
-        )sql", MakeConflictClause(storeType, "","", "ON CONFLICT(set_id) DO NOTHING")));
+            ON CONFLICT(set_id) DO UPDATE SET code=excluded.code, name=excluded.name,
+                released_at=excluded.released_at, set_type=excluded.set_type
+        )sql");
 
             SQLite::Statement upsertPrinting(database, std::format(R"sql(
             INSERT INTO printings (
@@ -425,9 +435,13 @@ namespace magindex::storage {
             INSERT OR IGNORE INTO card_faces (
                 card_id, ordinal, name, colors, cmc, mana_cost,
                 defense, defense_numeric, power, power_numeric, toughness,
-                toughness_numeric, loyalty, loyalty_numeric, type_line,
+                toughness_numeric, loyalty, loyalty_numeric, type_line
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         )sql");
+            SQLite::Statement insertFaceSupertype(database,
+                "INSERT OR IGNORE INTO oracle_face_supertypes(card_id, ordinal, supertype) VALUES (?, ?, ?)");
+            SQLite::Statement insertFaceSubtype(database,
+                "INSERT OR IGNORE INTO oracle_face_subtypes(card_id, ordinal, subtype) VALUES (?, ?, ?)");
 
             SQLite::Statement upsertPrintingFace(database, R"sql(
                 INSERT INTO printing_faces(printing_id, ordinal, name, artist, artist_id, image_small, image_normal)
@@ -455,20 +469,14 @@ namespace magindex::storage {
                 database, "INSERT OR IGNORE INTO subtypes(card_id, subtype) VALUES (?, ?)");
 
 
-            SQLite::Statement deleteCard(database, "DELETE FROM cards WHERE card_id = ?");
+            SQLite::Statement deleteCard(database, "DELETE FROM cards WHERE oracle_id = ?");
             SQLite::Statement deleteFaces(database, "DELETE FROM card_faces WHERE card_id = ?");
             SQLite::Statement deleteKeywords(database, "DELETE FROM keywords WHERE card_id = ?");
             SQLite::Statement deleteLegalities(database, "DELETE FROM legalities WHERE card_id = ?");
-            SQLite::Statement deleteFinishes(database, "DELETE FROM finishes WHERE printing_id = ?");
-            SQLite::Statement deletePrintingFaces(database, "DELETE FROM printing_faces WHERE printing_id = ?");
-            SQLite::Statement deleteFrameEffects(database, "DELETE FROM frame_effects WHERE printing_id = ?");
-            SQLite::Statement deleteArtistIds(database, "DELETE FROM artist_ids WHERE printing_id = ?");
+            SQLite::Statement deleteSupertypes(database, "DELETE FROM supertypes WHERE card_id = ?");
+            SQLite::Statement deleteSubtypes(database, "DELETE FROM subtypes WHERE card_id = ?");
             SQLite::Statement deletePrintingsFromSet(database, "DELETE FROM printings WHERE set_id = ?");
             SQLite::Statement deleteSet(database, "DELETE FROM sets WHERE set_id = ?");
-
-            if (storeType == TotalReplacement) {
-                EmptyStorage();
-            }
 
             for (const OracleSet& set : cardChunk.Sets | std::views::values) {
                 if (storeType == SetsReplacement) {
@@ -502,6 +510,15 @@ namespace magindex::storage {
                     deleteCard.bind(1, card.OracleId);
                     deleteCard.exec();
                     deleteCard.reset();
+                }
+
+                // Oracle-level metadata is a complete snapshot in OracleCard. Replace its
+                // normalized children so removed values do not survive an incremental update.
+                for (SQLite::Statement *statement : {&deleteFaces, &deleteKeywords, &deleteLegalities,
+                                                     &deleteSupertypes, &deleteSubtypes}) {
+                    statement->bind(1, card.OracleId);
+                    statement->exec();
+                    Reset(*statement);
                 }
 
 
@@ -575,9 +592,26 @@ namespace magindex::storage {
 
                     insertFace.exec();
                     Reset(insertFace);
+
+                    for (const std::string &supertype : face.SuperTypes) {
+                        insertFaceSupertype.bind(1, card.OracleId);
+                        insertFaceSupertype.bind(2, static_cast<int>(face.Ordinal));
+                        insertFaceSupertype.bind(3, supertype);
+                        insertFaceSupertype.exec();
+                        Reset(insertFaceSupertype);
+                    }
+                    for (const std::string &subtype : face.SubTypes) {
+                        insertFaceSubtype.bind(1, card.OracleId);
+                        insertFaceSubtype.bind(2, static_cast<int>(face.Ordinal));
+                        insertFaceSubtype.bind(3, subtype);
+                        insertFaceSubtype.exec();
+                        Reset(insertFaceSubtype);
+                    }
                 }
 
                 for (const Printing& printing : card.Printings) {
+                    if (printing.Id.empty())
+                        throw std::invalid_argument("Cannot store a printing with an empty Scryfall ID");
                     if (printing.SetId.empty() || printing.SetCode.empty() || printing.SetName.empty() || printing.SetType.empty())
                         throw std::invalid_argument("Cannot store a card with incomplete set metadata");
                     if (printing.CollectorNumber.empty() || printing.Rarity.empty())
@@ -629,7 +663,7 @@ namespace magindex::storage {
                         Reset(insertPromoType);
                     }
 
-                    for (const PrintingFace& face : printing) {
+                    for (const PrintingFace& face : printing.Faces) {
                         upsertPrintingFace.bind(1, printing.Id);
                         upsertPrintingFace.bind(2, static_cast<int>(face.Ordinal));
                         upsertPrintingFace.bind(3, face.Name);
@@ -639,7 +673,7 @@ namespace magindex::storage {
                         BindNullableText(upsertPrintingFace, 7, face.NormalImageURI);
 
                         upsertPrintingFace.exec();
-                        Reset(insertFace);
+                        Reset(upsertPrintingFace);
                     }
                 }
             }
@@ -731,11 +765,15 @@ namespace magindex::storage {
             values.emplace_back(format); values.emplace_back(expected);
         }
         for (const auto &type : query.Supertypes()) {
-            fromWhere += " AND EXISTS(SELECT 1 FROM supertypes st WHERE st.card_id=c.oracle_id AND st.supertype=?)";
+            fromWhere += " AND (EXISTS(SELECT 1 FROM supertypes st WHERE st.card_id=c.oracle_id AND st.supertype=?)"
+                         " OR EXISTS(SELECT 1 FROM oracle_face_supertypes fst WHERE fst.card_id=c.oracle_id AND fst.supertype=?))";
+            values.emplace_back(type);
             values.emplace_back(type);
         }
         for (const auto &type : query.Subtypes()) {
-            fromWhere += " AND EXISTS(SELECT 1 FROM subtypes st WHERE st.card_id=c.oracle_id AND st.subtype=?)";
+            fromWhere += " AND (EXISTS(SELECT 1 FROM subtypes st WHERE st.card_id=c.oracle_id AND st.subtype=?)"
+                         " OR EXISTS(SELECT 1 FROM oracle_face_subtypes fst WHERE fst.card_id=c.oracle_id AND fst.subtype=?))";
+            values.emplace_back(type);
             values.emplace_back(type);
         }
         for (const auto &symbol : query.ManaSymbols()) {
@@ -796,6 +834,10 @@ namespace magindex::storage {
                 "FROM cards WHERE oracle_id=?");
             SQLite::Statement facesStmt(database,
                 "SELECT ordinal,name,colors,cmc,mana_cost,defense,power,toughness,loyalty,type_line FROM card_faces WHERE card_id=? ORDER BY ordinal");
+            SQLite::Statement faceSupertypesStmt(database,
+                "SELECT ordinal,supertype FROM oracle_face_supertypes WHERE card_id=? ORDER BY ordinal,supertype");
+            SQLite::Statement faceSubtypesStmt(database,
+                "SELECT ordinal,subtype FROM oracle_face_subtypes WHERE card_id=? ORDER BY ordinal,subtype");
             SQLite::Statement keywordsStmt(database,"SELECT keyword FROM keywords WHERE card_id=? ORDER BY keyword");
             SQLite::Statement legalitiesStmt(database,"SELECT format,legality FROM legalities WHERE card_id=? ORDER BY format");
             SQLite::Statement supersStmt(database,"SELECT supertype FROM supertypes WHERE card_id=? ORDER BY supertype");
@@ -812,8 +854,6 @@ namespace magindex::storage {
             SQLite::Statement promoStmt(database,"SELECT promo_type FROM promo_types WHERE printing_id=? ORDER BY promo_type");
             SQLite::Statement printingFacesStmt(database,
                 "SELECT ordinal,name,artist,artist_id,image_small,image_normal FROM printing_faces WHERE printing_id=? ORDER BY ordinal");
-            SQLite::Statement legacyFaceStmt(database,
-                "SELECT ordinal,name,artist,artist_id,image_small,image_normal FROM card_faces WHERE card_id=? ORDER BY ordinal");
 
             auto loadStrings=[](SQLite::Statement &stmt,const std::string &key,auto add) {
                 stmt.bind(1,key);
@@ -833,6 +873,17 @@ namespace magindex::storage {
                 card.Defense=col(10).getString(); card.Loyalty=col(11).getString(); card.OracleText=col(12).getString();
                 Reset(oracleStmt);
 
+                std::map<int, std::set<std::string>> faceSupertypes;
+                faceSupertypesStmt.bind(1, oracleId);
+                while (faceSupertypesStmt.executeStep())
+                    faceSupertypes[faceSupertypesStmt.getColumn(0).getInt()].insert(faceSupertypesStmt.getColumn(1).getString());
+                Reset(faceSupertypesStmt);
+                std::map<int, std::set<std::string>> faceSubtypes;
+                faceSubtypesStmt.bind(1, oracleId);
+                while (faceSubtypesStmt.executeStep())
+                    faceSubtypes[faceSubtypesStmt.getColumn(0).getInt()].insert(faceSubtypesStmt.getColumn(1).getString());
+                Reset(faceSubtypesStmt);
+
                 facesStmt.bind(1,oracleId);
                 while(facesStmt.executeStep()) {
                     auto fc=[&](int i){return facesStmt.getColumn(i);};
@@ -841,6 +892,10 @@ namespace magindex::storage {
                     face.Colors=static_cast<Colors>(fc(2).getInt()); face.Cmc=static_cast<float>(fc(3).getDouble());
                     face.ManaCost=fc(4).getString(); face.Defense=fc(5).getString(); face.Power=fc(6).getString();
                     face.Toughness=fc(7).getString(); face.Loyalty=fc(8).getString(); face.TypeLine=fc(9).getString();
+                    if (const auto it = faceSupertypes.find(static_cast<int>(face.Ordinal)); it != faceSupertypes.end())
+                        face.SuperTypes = it->second;
+                    if (const auto it = faceSubtypes.find(static_cast<int>(face.Ordinal)); it != faceSubtypes.end())
+                        face.SubTypes = it->second;
                     card.Faces.push_back(std::move(face));
                 }
                 Reset(facesStmt);
@@ -891,17 +946,6 @@ namespace magindex::storage {
                         p.Faces.push_back(std::move(f));
                     }
                     Reset(printingFacesStmt);
-                    if(p.Faces.empty()) {
-                        legacyFaceStmt.bind(1,oracleId);
-                        while(legacyFaceStmt.executeStep()) {
-                            auto fc=[&](int i){return legacyFaceStmt.getColumn(i);};
-                            types::PrintingFace f; f.Ordinal=static_cast<std::uint8_t>(fc(0).getInt());
-                            f.Name=fc(1).getString(); f.Artist=fc(2).getString(); f.ArtistId=fc(3).getString();
-                            f.SmallImageURI=fc(4).getString(); f.NormalImageURI=fc(5).getString();
-                            p.Faces.push_back(std::move(f));
-                        }
-                        Reset(legacyFaceStmt);
-                    }
                     card.Printings.push_back(std::move(p));
                 }
                 Reset(printsStmt);

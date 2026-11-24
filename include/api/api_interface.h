@@ -11,6 +11,11 @@
 #include "types/oracle_card.h"
 #include "types/query_builder.h"
 
+namespace magindex::storage {
+    enum StoreType : uint8_t;
+    class CardChunk;
+}
+
 namespace magindex::api {
     // Owns the database connection for its lifetime. Synchronous calls run on
     // the calling thread; a context serializes its own operations.
@@ -25,7 +30,7 @@ namespace magindex::api {
         [[nodiscard]] types::QueryPage Query(const types::CardQuery &query,
                                              types::PageRequest page = {});
 
-        void StoreCards(const std::vector<types::Card>& Cards);
+        void StoreCards(const storage::CardChunk& CardChunk, storage::StoreType storeType);
 
         void GetTrackedSets(std::map<std::string, uint64_t>& OUTTrackedSets);
 

@@ -88,6 +88,9 @@ namespace magindex::types {
     };
 
     struct OracleSet {
+        OracleSet() = default;
+        OracleSet(const std::string& InId, const std::string& InCode, const std::string& InName, const std::chrono::year_month_day& InReleasedAt, const std::string& InType) :
+        Id(InId), Code(InCode), Name(InName), ReleasedAt(InReleasedAt), Type(InType) {}
         std::string Id;
         std::string Code;
         std::string Name;

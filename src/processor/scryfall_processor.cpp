@@ -3,6 +3,7 @@
 #include <array>
 #include <ranges>
 #include <fstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,8 +16,6 @@
 namespace {
     using json = nlohmann::json;
     using namespace magindex::types;
-
-    constexpr std::size_t INITIAL_CARD_VECTOR_ALLOCATION = 150000;
 
     class GzipInput {
     public:
@@ -180,9 +179,11 @@ namespace {
             newCardFace.Toughness = OptionalString(face, "toughness");
             newCardFace.Loyalty = OptionalString(face, "loyalty");
             newCardFace.TypeLine = OptionalString(face, "type_line");
-            ParseTypes(object, newCardFace.SuperTypes, newCardFace.SubTypes);
+            ParseTypes(face, newCardFace.SuperTypes, newCardFace.SubTypes);
 
             PrintingFace& newPrintingFace = OUTPrintingFaces.emplace_back();
+            newPrintingFace.Ordinal = newCardFace.Ordinal;
+            newPrintingFace.Name = newCardFace.Name;
             newPrintingFace.Artist = OptionalString(face, "artist");
             newPrintingFace.ArtistId = OptionalString(face, "artist_id");
             newPrintingFace.SmallImageURI = SmallImageUri(face);
@@ -234,9 +235,25 @@ namespace {
         return result;
     }
 
-    void ParseCard(const json &object, std::map<std::string, OracleCard>& OUTCards) {
+    void ParseSet(const json& object, std::string& OUTSetCode, std::string& OUTSetName, std::string& OUTSetType, std::chrono::year_month_day& OUTSetDate) {
+        OUTSetCode = RequiredString(object, "set");
+        OUTSetName = RequiredString(object, "set_name");
+        OUTSetDate = RequiredDate(object, "released_at");
+        OUTSetType = RequiredString(object, "set_type");
+    }
+
+    void ParseCard(const json &object) {
         if (!object.is_object())
             throw std::runtime_error("Each JSONL record must be a card object");
+
+        std::string setCode = RequiredString(object, "set");
+        std::string setName = RequiredString(object, "set_name");
+        std::chrono::year_month_day setReleaseDate = RequiredDate(object, "set");
+        std::string setType = RequiredString(object, "set_type");
+
+        if (!OUTSets.contains(setId)) {
+            OUTSets.try_emplace(setId, setId, setCode, setName, setReleaseDate, setType);
+        }
 
         OracleCard* TargetCard = nullptr;
 
@@ -301,31 +318,47 @@ namespace {
         cardPrinting.Promo = OptionalBool(object, "promo");
         cardPrinting.Rarity = RequiredString(object, "rarity");
         cardPrinting.Reprint = OptionalBool(object, "reprint");
-        cardPrinting.SetId = OptionalString(object, "set_id");
-        cardPrinting.SetCode = OptionalString(object, "set");
-        cardPrinting.SetName = OptionalString(object, "set_name");
-        cardPrinting.SetType = OptionalString(object, "set_type");
+        cardPrinting.SetId = setId;
+        cardPrinting.SetCode = setCode;
+        cardPrinting.SetName = setName;
+        cardPrinting.SetType = setType;
         cardPrinting.Textless = OptionalBool(object, "textless");
         cardPrinting.Faces.insert(cardPrinting.Faces.end(), printingFaces.begin(), printingFaces.end());
     }
 
+    void ParseCardForPatch() {
+
+    }
+
+    void ParseCardForSetPatch() {
+        //If we are targeting specific sets and this card isnt from the set, skip it
+        std::string setId = RequiredString(object, "set_id");
+
+        if (_setsToPatchFromBulkFile)
+        if (!targetSets.empty() && !targetSets.contains(setId)) {
+            return;
+        }
+    }
+
+    void ParseCardForTotalReset() {
+
+    }
     void ParseLine(const std::filesystem::path &path,
                    std::size_t lineNumber,
-                   std::string line,
-                   std::map<std::string, OracleCard>& OUTCards) {
+                   std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
         if (line.empty())
             return;
 
         try {
-            ParseCard(json::parse(line), OUTCards);
+            ParseCard(json::parse(line));
         } catch (const std::exception &error) {
             throw std::runtime_error(path.string() + ": line " + std::to_string(lineNumber) + ": " + error.what());
         }
     }
 
-    void ReadPlainJsonl(const std::filesystem::path &path, std::map<std::string, OracleCard> &cards) {
+    void ReadPlainJsonl(const std::filesystem::path &path) {
         std::ifstream input(path, std::ios::binary);
         if (!input)
             throw std::runtime_error("Unable to open card file: " + path.string());
@@ -334,13 +367,13 @@ namespace {
         std::size_t lineNumber = 0;
         while (std::getline(input, line)) {
             ++lineNumber;
-            ParseLine(path, lineNumber, std::move(line), cards);
+            ParseLine(path, lineNumber, std::move(line));
         }
         if (input.bad())
             throw std::runtime_error("I/O error while reading card file: " + path.string());
     }
 
-    void ReadGzipJsonl(const std::filesystem::path &path, std::map<std::string, OracleCard> &cards) {
+    void ReadGzipJsonl(const std::filesystem::path &path) {
         GzipInput input(path);
         if (!input.get())
             throw std::runtime_error("Unable to open gzip card file: " + path.string());
@@ -371,7 +404,7 @@ namespace {
             std::size_t newline = 0;
             while ((newline = pending.find('\n', lineStart)) != std::string::npos) {
                 ++lineNumber;
-                ParseLine(path, lineNumber, pending.substr(lineStart, newline - lineStart), cards);
+                ParseLine(path, lineNumber, pending.substr(lineStart, newline - lineStart));
                 lineStart = newline + 1;
             }
             if (lineStart > 0)
@@ -380,7 +413,7 @@ namespace {
 
         if (!pending.empty()) {
             ++lineNumber;
-            ParseLine(path, lineNumber, std::move(pending), cards);
+            ParseLine(path, lineNumber, std::move(pending));
         }
 
         if (input.Close() != Z_OK)
@@ -399,25 +432,54 @@ namespace {
 
 namespace magindex::processor {
 
-std::map<std::string, OracleCard> ScryfallProcessor::Process(std::filesystem::path file, UpdateType updateType) {
-    switch (updateType) {
-        case UpdateType::None:
-            return {};
-        case UpdateType::Incremental:
-        case UpdateType::IncrementalUsingBulk:
-        case UpdateType::TotalBulk:
-            break;
-        default:
-            throw std::invalid_argument("Unsupported update type");
+
+void ScryfallProcessor::ReadFile(const std::filesystem::path& file) {
+
+    if (ProcessingMode == UpdateType::None) {
+        throw std::invalid_argument("Processing mode not set");
     }
 
-    std::map<std::string, OracleCard> cards;
+    if (_OUTCards.expired()) {
+        throw std::invalid_argument("Output cards was invalid");
+    }
+
+    switch (ProcessingMode) {
+        case UpdateType::None:
+            throw std::invalid_argument("Processing mode not set");
+        case UpdateType::TotalReset:
+        case UpdateType::PatchSets:
+            if (_OUTSets.expired()) {
+                throw std::invalid_argument("Output sets not set during patch sets");
+            }
+            break;
+        case UpdateType::PatchCards:
+            break;
+    }
 
     if (IsGzipFile(file))
-        ReadGzipJsonl(file, cards);
+        ReadGzipJsonl(file);
     else
-        ReadPlainJsonl(file, cards);
-    return cards;
+        ReadPlainJsonl(file);
+}
+
+void ScryfallProcessor::ProcessCardsPatch(const std::filesystem::path &file, std::weak_ptr<std::map<std::string, types::OracleCard>> OUTCards) {
+
+    _OUTCards = std::move(OUTCards);
+    ProcessingMode = UpdateType::PatchCards;
+    ReadFile(file);
+}
+
+void ScryfallProcessor::ProcessSetsPatch(const std::filesystem::path &file, std::weak_ptr<std::map<std::string, types::OracleCard>> OUTCards, std::weak_ptr<std::map<std::string, types::OracleSet>> OUTSets, std::weak_ptr<std::set<std::string>> setsToPatchFromBulkFile) {
+    _OUTCards = std::move(OUTCards);
+    _OUTSets = std::move(OUTSets);
+    _setsToPatchFromBulkFile = std::move(setsToPatchFromBulkFile);
+    ProcessingMode = UpdateType::PatchSets;
+}
+
+void ScryfallProcessor::ProcessTotalReset(const std::filesystem::path &file, std::weak_ptr<std::map<std::string, types::OracleCard>> OUTCards, std::weak_ptr<std::map<std::string, types::OracleSet>> OUTSets) {
+    _OUTCards = std::move(OUTCards);
+    _OUTSets = std::move(OUTSets);
+    ProcessingMode = UpdateType::TotalReset;
 }
 
 }

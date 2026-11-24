@@ -1,11 +1,7 @@
 #pragma once
 
 #include <filesystem>
-#include <vector>
-
-#include "types/card.h"
 #include "types/oracle_card.h"
-#include "types/update_type.h"
 
 namespace magindex::processor {
     class ProcessorBase {
@@ -20,9 +16,11 @@ namespace magindex::processor {
          * may be the files parent directory. Typically, the path will just be a single file.
          *
          * @param path The path to process
-         * @param updateType The update type of the download. Useful for determining how to process the file(s)
+         * @param targetSets The sets we want to update. If specified, only cards from the given sets will be processed. Leave empty to process all cards
+         * @param OUTCards The output cards we process
+         * @param OUTSets The sets we have among our processed OUTCards.
          */
-        virtual std::map<std::string, types::OracleCard> Process(std::filesystem::path path, UpdateType updateType) =
+        virtual void Process(const std::filesystem::path& path, const std::set<std::string>& targetSets, std::map<std::string, types::OracleCard>& OUTCards, std::map<std::string, types::OracleSet>& OUTSets) =
         0;
     };
 }
