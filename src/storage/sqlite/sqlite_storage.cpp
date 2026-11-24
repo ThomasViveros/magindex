@@ -28,12 +28,6 @@ namespace {
 
     using QueryValue = std::variant<std::string, int, double>;
 
-    void AddCondition(std::string &sql, std::vector<QueryValue> &values,
-                      std::string condition, QueryValue value) {
-        sql += " AND (" + std::move(condition) + ")";
-        values.push_back(std::move(value));
-    }
-
     std::string ComparisonSql(EqualityOperators op) {
         switch (op) {
             case EqualityOperators::GreaterThan: return ">";
@@ -388,14 +382,24 @@ namespace magindex::storage {
 
     SQLiteStorage::~SQLiteStorage() = default;
 
-    void SQLiteStorage::Store(const CardChunk &cardChunk, StoreType storeType) {
-        if (cardChunk.cards.empty() && cardChunk.Sets.empty() && storeType != TotalReplacement)
+    void SQLiteStorage::Store(const CardChunk &cardChunk, UpdateType updateType) {
+        switch (updateType) {
+            case UpdateType::PatchCards:
+            case UpdateType::PatchSets:
+            case UpdateType::TotalReset:
+                break;
+            case UpdateType::None:
+            default:
+                throw std::invalid_argument("Cannot store a batch with an invalid or empty update type");
+        }
+
+        if (cardChunk.cards.empty() && cardChunk.Sets.empty() && updateType != UpdateType::TotalReset)
             return;
 
         try {
             SQLite::Database &database = impl_->database;
             SQLite::Transaction transaction(database);
-            if (storeType == TotalReplacement) {
+            if (updateType == UpdateType::TotalReset) {
                 database.exec("DELETE FROM cards");
                 database.exec("DELETE FROM sets");
             }
@@ -479,7 +483,7 @@ namespace magindex::storage {
             SQLite::Statement deleteSet(database, "DELETE FROM sets WHERE set_id = ?");
 
             for (const OracleSet& set : cardChunk.Sets | std::views::values) {
-                if (storeType == SetsReplacement) {
+                if (updateType == UpdateType::PatchSets) {
                     //Delete all printings with our sets.
                     deletePrintingsFromSet.bind(1, set.Id);
                     deletePrintingsFromSet.exec();
@@ -505,7 +509,7 @@ namespace magindex::storage {
                 if (card.OracleId.empty() || card.Name.empty())
                     throw std::invalid_argument("Cannot store a card with an empty printing ID, oracle ID, or name");
 
-                if (storeType == CardReplacement) {
+                if (updateType == UpdateType::PatchCards) {
                     //Delete each card before inserting. We delete instead of updating in order to trigger cascades
                     deleteCard.bind(1, card.OracleId);
                     deleteCard.exec();

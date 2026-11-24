@@ -17,6 +17,7 @@ find_package(ZLIB REQUIRED)
 
 add_library(Magindex STATIC
         src/api/api_interface.cpp
+        src/api/update_service.cpp
         src/importer/scryfall_client.cpp
         src/processor/scryfall_processor.cpp
         src/importer/scryfall_importer.cpp

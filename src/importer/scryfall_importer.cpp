@@ -569,16 +569,21 @@ namespace magindex::importer {
         return std::string(encoded.get());
     }
 
-    std::string makeScryfallSetUrl(CURL *curl, const std::vector<std::string> &sets) {
-        std::string query = buildSetQuery(sets);
+    std::string makeScryfallSearchUrl(CURL *curl, const std::string& query,
+                                      bool includeMultilingual = false,
+                                      bool includeVariations = false) {
         if (query.empty())
-            throw std::runtime_error("Cannot build a Scryfall query for an empty set list");
-
+            throw std::invalid_argument("Cannot build a Scryfall search URL for an empty query");
         CurlUrlHandle url_handle(curl_url());
         if (!url_handle)
             throw std::runtime_error("Failed to create URL handle");
         const std::string escapedQuery = encodeURL(curl, query);
-        const std::string queryParam = "unique=prints&q=" + escapedQuery;
+        std::string queryParam = "unique=prints";
+        if (includeMultilingual)
+            queryParam += "&include_multilingual=true";
+        if (includeVariations)
+            queryParam += "&include_variations=true";
+        queryParam += "&q=" + escapedQuery;
         CURLUcode result = curl_url_set(url_handle.get(), CURLUPART_URL,
                                         "https://api.scryfall.com/cards/search", 0);
         if (result == CURLUE_OK)
@@ -602,17 +607,14 @@ namespace magindex::importer {
         return std::string(finalUrl.get());
     }
 
-    std::string makeScryfallCardUrl(CURL* curl, const std::string& cardName) {
+    std::string makeScryfallSetUrl(CURL *curl, const std::vector<std::string> &sets) {
+        return makeScryfallSearchUrl(curl, buildSetQuery(sets));
+    }
 
-        char* encodedName = curl_easy_escape(curl, cardName.c_str(), 0);
-        if (!encodedName) {
-            return {};
-        }
-
-        std::string url = "https://api.scryfall.com/cards/search?q=%21%22" + std::string(encodedName) + "%22";
-
-        curl_free(encodedName);
-        return url;
+    std::string makeScryfallOracleIdUrl(CURL *curl, const std::string& oracleId) {
+        if (oracleId.empty())
+            throw std::invalid_argument("Oracle ID cannot be empty");
+        return makeScryfallSearchUrl(curl, "oracleid:" + oracleId, false, true);
     }
 
     json RequestPage(CURL *curl, const std::string& url) {
@@ -741,6 +743,25 @@ namespace magindex::importer {
 
         std::filesystem::path importFilePath = directory / importFileName;
 
+        if (Sets.empty())
+            throw std::invalid_argument("At least one Scryfall set ID or code is required");
+
+        // Scryfall search queries use set codes. Resolve IDs here too so callers can
+        // use the set ID exposed by the public Magindex API.
+        std::vector<SetMetadata> setMetadata;
+        GetSetMetadata(setMetadata);
+        std::vector<std::string> setCodes;
+        std::set<std::string> seenCodes;
+        for (const std::string& identifier : Sets) {
+            const auto match = std::ranges::find_if(setMetadata, [&](const SetMetadata& metadata) {
+                return metadata.id == identifier || metadata.code == identifier;
+            });
+            if (match == setMetadata.end())
+                throw std::invalid_argument("Unknown Scryfall set ID or code: " + identifier);
+            if (seenCodes.insert(match->code).second)
+                setCodes.push_back(match->code);
+        }
+
         json OUTCards = json::array();
 
         // Retrieve the cards for sets that need an update.
@@ -748,7 +769,7 @@ namespace magindex::importer {
         if (!curl)
             throw std::runtime_error("Failed to create CURL handle");
 
-        std::string url = makeScryfallSetUrl(curl.get(), Sets);
+        std::string url = makeScryfallSetUrl(curl.get(), setCodes);
 
         CrawlPages(curl.get(), url, OUTCards, std::nullopt);
 
@@ -757,21 +778,26 @@ namespace magindex::importer {
         return ImportResult{importFilePath, PatchSets{}};
     }
 
-    ImportResult ScryfallImporter::ImportCardForPatch(const std::filesystem::path &directory, const std::string& cardName) {
+    ImportResult ScryfallImporter::ImportCardForPatch(const std::filesystem::path &directory, const std::string& oracleId) {
         constexpr const char *importFileName = "card_patch.jsonl";
 
         std::filesystem::path importFilePath = directory / importFileName;
 
+        if (oracleId.empty())
+            throw std::invalid_argument("Oracle ID is required to patch a card");
+
         json OUTCards = json::array();
 
-        // Retrieve the cards for sets that need an update.
+        // Query by Oracle ID and retain every print, including multilingual and
+        // variation records, so CardReplacement can rebuild the complete card.
         CurlHandle curl(curl_easy_init());
         if (!curl)
             throw std::runtime_error("Failed to create CURL handle");
 
-        std::string url = makeScryfallCardUrl(curl.get(), cardName);
+        std::string url = makeScryfallOracleIdUrl(curl.get(), oracleId);
 
-        CrawlPages(curl.get(), url, OUTCards, std::nullopt);
+        if (!CrawlPages(curl.get(), url, OUTCards, std::nullopt))
+            throw std::runtime_error("Scryfall did not return all pages for Oracle ID: " + oracleId);
 
         SaveCardsInJson(importFilePath, OUTCards);
 

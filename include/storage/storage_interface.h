@@ -4,15 +4,9 @@
 #include <string>
 #include "types/query_builder.h"
 #include "types/oracle_card.h"
+#include "types/update_type.h"
 
 namespace magindex::storage {
-
-    enum StoreType : uint8_t{
-        NA,
-        SetsReplacement,
-        CardReplacement,
-        TotalReplacement,
-    };
 
     template<typename T>
     class StorageBase {
@@ -23,9 +17,9 @@ namespace magindex::storage {
 
         /**
          * @param data The card data to be stored
-         * @param storeType What type of storing we are doing.
+         * @param updateType The replacement flow used for this data batch.
          */
-        virtual void Store(const T &data, StoreType storeType) = 0;
+        virtual void Store(const T &data, ::UpdateType updateType) = 0;
 
         /**
          * Drops all cards from our storage.

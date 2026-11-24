@@ -10,9 +10,9 @@
 #include "types/card.h"
 #include "types/oracle_card.h"
 #include "types/query_builder.h"
+#include "types/update_type.h"
 
 namespace magindex::storage {
-    enum StoreType : uint8_t;
     class CardChunk;
 }
 
@@ -30,7 +30,7 @@ namespace magindex::api {
         [[nodiscard]] types::QueryPage Query(const types::CardQuery &query,
                                              types::PageRequest page = {});
 
-        void StoreCards(const storage::CardChunk& CardChunk, storage::StoreType storeType);
+        void StoreCards(const storage::CardChunk& CardChunk, ::UpdateType updateType);
 
         void GetTrackedSets(std::map<std::string, uint64_t>& OUTTrackedSets);
 
@@ -64,14 +64,28 @@ void magindex_close(MagindexHandle *handle);
 /**
  *
  * @param handle Handle generated from magindex_open call
- * @param ignore_set_type_json Optional set types to ignore.
+ * @param ignore_set_type_json Optional UTF-8 JSON object. Pass NULL or an empty
+ *        string to ignore no set types; otherwise use
+ *        {"SetTypesToIgnore":["digital", "token"]}.
  * @return Status
  */
 MagindexStatus magindex_update(MagindexHandle* handle, const char *ignore_set_type_json);
 
-    MagindexStatus magindex_patch_set();
+/**
+ * @param handle Handle generated form magindex_open call
+ * @param set_id_utf8 Scryfall set ID or set code to patch
+ *
+ * @return Status
+ */
+MagindexStatus magindex_patch_set(MagindexHandle* handle, const char* set_id_utf8);
 
-    void magindex_patch_card();
+/**
+ *
+ * @param handle Handle generated from magindex_open call
+ * @param oracle_id_utf8 Oracle ID shared by the card's printings
+ * @return Status
+ */
+MagindexStatus magindex_patch_card(MagindexHandle* handle, const char* oracle_id_utf8);
 
 
 

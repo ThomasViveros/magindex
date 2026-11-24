@@ -34,7 +34,7 @@ namespace magindex::storage {
 
         SQLiteStorage &operator=(const SQLiteStorage &) = delete;
 
-        void Store(const CardChunk &cards, StoreType storeType) override;
+        void Store(const CardChunk &cards, ::UpdateType updateType) override;
 
         void EmptyStorage() override;
 

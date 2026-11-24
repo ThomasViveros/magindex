@@ -8,15 +8,15 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <ios>
 #include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
-#include "importer/scryfall_importer.h"
-#include "processor/scryfall_processor.h"
 #include "storage/sqlite/sqlite_storage.h"
+#include "update_service.h"
 
 namespace {
     using json = nlohmann::json;
@@ -236,11 +236,20 @@ namespace {
             {"faces", std::move(faces)}, {"printings", std::move(printings)}};
     }
 
-    void ParseSetTypesToIgnore(const json& object, std::set<std::string> OUTSetTypesToIgnore) {
-        if (object.contains("SetTypesToIgnore") && object["SetTypesToIgnore"].is_array()) {
-            for (const auto& set : object["SetTypesToIgnore"]) {
-                OUTSetTypesToIgnore.insert(set.get<std::string>());
-            }
+    void ParseSetTypesToIgnore(const json& object, std::set<std::string>& OUTSetTypesToIgnore) {
+        if (!object.is_object())
+            throw std::invalid_argument("ignore_set_type_json must contain a JSON object");
+
+        const auto types = object.find("SetTypesToIgnore");
+        if (types == object.end())
+            return;
+        if (!types->is_array())
+            throw std::invalid_argument("'SetTypesToIgnore' must be an array of strings");
+
+        for (const auto& setType : *types) {
+            if (!setType.is_string())
+                throw std::invalid_argument("Every 'SetTypesToIgnore' entry must be a string");
+            OUTSetTypesToIgnore.insert(setType.get<std::string>());
         }
     }
 
@@ -248,6 +257,24 @@ namespace {
         if (dynamic_cast<const std::invalid_argument *>(&error)) return MAGINDEX_STATUS_INVALID_ARGUMENT;
         if (dynamic_cast<const SQLite::Exception *>(&error)) return MAGINDEX_STATUS_DATABASE_ERROR;
         if (dynamic_cast<const std::runtime_error *>(&error)) return MAGINDEX_STATUS_DATABASE_ERROR;
+        return MAGINDEX_STATUS_INTERNAL_ERROR;
+    }
+
+    MagindexStatus StatusForUpdateException(const std::exception& error) {
+        if (dynamic_cast<const magindex::api::detail::StorageFailure *>(&error))
+            return MAGINDEX_STATUS_DATABASE_ERROR;
+        if (dynamic_cast<const magindex::api::detail::NoMatchingOracleCard *>(&error))
+            return MAGINDEX_STATUS_QUERY_ERROR;
+        if (dynamic_cast<const std::invalid_argument *>(&error) ||
+            dynamic_cast<const nlohmann::json::exception *>(&error))
+            return MAGINDEX_STATUS_INVALID_ARGUMENT;
+        if (dynamic_cast<const SQLite::Exception *>(&error))
+            return MAGINDEX_STATUS_DATABASE_ERROR;
+        if (dynamic_cast<const std::filesystem::filesystem_error *>(&error) ||
+            dynamic_cast<const std::ios_base::failure *>(&error))
+            return MAGINDEX_STATUS_IO_ERROR;
+        if (dynamic_cast<const std::runtime_error *>(&error))
+            return MAGINDEX_STATUS_IO_ERROR;
         return MAGINDEX_STATUS_INTERNAL_ERROR;
     }
 }
@@ -273,9 +300,9 @@ namespace magindex::api {
         impl_->storage.GetAllTrackedSets(OUTTrackedSets);
     }
 
-    void Context::StoreCards(const storage::CardChunk& CardChunk, storage::StoreType storeType) {
+    void Context::StoreCards(const storage::CardChunk& CardChunk, ::UpdateType updateType) {
         std::lock_guard lock(impl_->mutex);
-        impl_->storage.Store(CardChunk, storeType);
+        impl_->storage.Store(CardChunk, updateType);
     }
 
     void Context::Clear() {
@@ -287,9 +314,15 @@ namespace magindex::api {
 struct MagindexHandle {
 
     MagindexHandle() = delete;
-    explicit MagindexHandle(const std::filesystem::path& magindexEnvironmentPath, const std::filesystem::path &path) : MagindexEnvironmentPath(magindexEnvironmentPath), context(path) {}
+    explicit MagindexHandle(const std::filesystem::path& magindexEnvironmentPath, const std::filesystem::path &path)
+        : MagindexEnvironmentPath(magindexEnvironmentPath), context(path),
+          updateService(context, MagindexEnvironmentPath) {}
     const std::filesystem::path MagindexEnvironmentPath;
     magindex::api::Context context;
+    magindex::api::detail::UpdateService updateService;
+    // Serializes state-changing pipelines without blocking queries during downloads.
+    std::mutex operationMutex;
+    // Protects lastError independently from lengthy imports and processing.
     std::mutex mutex;
     std::string lastError;
 };
@@ -317,80 +350,115 @@ extern "C" void magindex_close(MagindexHandle *handle) {
     delete handle;
 }
 
-MagindexStatus magindex_update(MagindexHandle* handle, const char *ignore_set_type_json) {
+extern "C" MagindexStatus magindex_update(MagindexHandle* handle, const char *ignore_set_type_json) {
     if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
+    std::unique_lock<std::mutex> operationLock;
     try {
-        const json parsed = json::parse(ignore_set_type_json);
-
+        operationLock = std::unique_lock<std::mutex>(handle->operationMutex);
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
         std::set<std::string> setTypesToIgnore;
-
-        ParseSetTypesToIgnore(parsed, setTypesToIgnore);
-
-        magindex::importer::ScryfallImporter importer;
-
-        std::map<std::string, std::uint64_t> trackedSets;
-        handle->context.GetTrackedSets(trackedSets);
-
-        magindex::importer::ImportResult importResult = importer.ImportCardsForUpdate(handle->MagindexEnvironmentPath, trackedSets, setTypesToIgnore);
-
-        magindex::processor::ScryfallProcessor processor;
-
-        if (importResult.UpdateType == UpdateType::None) {
-            //We were up to date
-            return MAGINDEX_STATUS_OK;
+        if (ignore_set_type_json && ignore_set_type_json[0] != '\0') {
+            const json parsed = json::parse(ignore_set_type_json);
+            ParseSetTypesToIgnore(parsed, setTypesToIgnore);
         }
 
-        std::set<std::string> targetSets;
-        magindex::storage::StoreType storeType = magindex::storage::NA;
-
-        switch (importResult.UpdateType) {
-            case UpdateType::None:
-                return MAGINDEX_STATUS_OK;
-            case UpdateType::IncrementalUsingBulk:
-                targetSets = importResult.TargetSets;
-                storeType = magindex::storage::SetsReplacement;
-                break;
-            case UpdateType::Incremental:
-                storeType = magindex::storage::SetsReplacement;
-                break;
-            case UpdateType::TotalBulk:
-                storeType = magindex::storage::TotalReplacement;
-                break;
+        handle->updateService.Update(setTypesToIgnore);
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
         }
-
-        magindex::storage::CardChunk cardChunk;
-        processor.Process(importResult.InstallFilePath, targetSets, cardChunk.cards, cardChunk.Sets);
-
-        handle->context.StoreCards(cardChunk, storeType);
 
         return MAGINDEX_STATUS_OK;
-    }catch (...) {
+    } catch (const std::exception& error) {
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError = error.what();
+        }
+        return StatusForUpdateException(error);
+    } catch (...) {
+        std::lock_guard errorLock(handle->mutex);
+        handle->lastError = "Unknown error while updating Magindex";
         return MAGINDEX_STATUS_INTERNAL_ERROR;
     }
 }
 
-MagindexStatus magindex_patch_set(MagindexHandle* handle, const char* set_id_utf8) {
-
+extern "C" MagindexStatus magindex_patch_set(MagindexHandle* handle, const char* set_id_utf8) {
     if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
-    if (!set_id_utf8 || set_id_utf8[0] == '\0') return MAGINDEX_STATUS_INVALID_ARGUMENT;
-
+    std::unique_lock<std::mutex> operationLock;
     try {
+        operationLock = std::unique_lock<std::mutex>(handle->operationMutex);
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
 
+        if (!set_id_utf8 || set_id_utf8[0] == '\0')
+            throw std::invalid_argument("Set ID is required");
 
-    }catch (...) {
+        handle->updateService.PatchSet(set_id_utf8);
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
+        return MAGINDEX_STATUS_OK;
+    } catch (const std::exception& error) {
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError = error.what();
+        }
+        return StatusForUpdateException(error);
+    } catch (...) {
+        std::lock_guard errorLock(handle->mutex);
+        handle->lastError = "Unknown error while patching Scryfall set";
         return MAGINDEX_STATUS_INTERNAL_ERROR;
     }
-
-    return MAGINDEX_STATUS_OK;
 }
 
+extern "C" MagindexStatus magindex_patch_card(MagindexHandle* handle, const char* oracle_id_utf8) {
+    if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
+    std::unique_lock<std::mutex> operationLock;
+    try {
+        operationLock = std::unique_lock<std::mutex>(handle->operationMutex);
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
+
+        if (!oracle_id_utf8 || oracle_id_utf8[0] == '\0')
+            throw std::invalid_argument("Oracle ID is required");
+
+        handle->updateService.PatchCard(oracle_id_utf8);
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
+        return MAGINDEX_STATUS_OK;
+    } catch (const std::exception& error) {
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError = error.what();
+        }
+        return StatusForUpdateException(error);
+    } catch (...) {
+        std::lock_guard errorLock(handle->mutex);
+        handle->lastError = "Unknown error while patching Scryfall Oracle card";
+        return MAGINDEX_STATUS_INTERNAL_ERROR;
+    }
+}
 
 extern "C" MagindexStatus magindex_clear(MagindexHandle *handle) {
     if (!handle) return MAGINDEX_STATUS_INVALID_ARGUMENT;
+    std::unique_lock<std::mutex> operationLock;
     try {
-        std::lock_guard lock(handle->mutex);
+        operationLock = std::unique_lock<std::mutex>(handle->operationMutex);
         handle->context.Clear();
-        handle->lastError.clear();
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
         return MAGINDEX_STATUS_OK;
     } catch (const std::exception &error) {
         std::lock_guard lock(handle->mutex);
@@ -412,7 +480,6 @@ extern "C" MagindexStatus magindex_query_json(MagindexHandle *handle, const char
         const json parsed = json::parse(query_json);
         const CardQuery query = ParseQuery(parsed);
         const PageRequest page = ParsePage(parsed);
-        std::lock_guard lock(handle->mutex);
         const auto pageResult = handle->context.Query(query, page);
         json cards = json::array();
         for (const auto &card : pageResult.Cards) cards.push_back(OracleCardJson(card));
@@ -426,7 +493,10 @@ extern "C" MagindexStatus magindex_query_json(MagindexHandle *handle, const char
         buffer[output.size()] = '\0';
         *out_result_json = buffer;
         *out_result_size = output.size();
-        handle->lastError.clear();
+        {
+            std::lock_guard errorLock(handle->mutex);
+            handle->lastError.clear();
+        }
         return MAGINDEX_STATUS_OK;
     } catch (const std::exception &error) {
         std::lock_guard lock(handle->mutex);

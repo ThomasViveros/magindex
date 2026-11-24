@@ -11,15 +11,12 @@ namespace magindex::importer {
 
         //~ImporterBase Interface
         ImportResult
-        ImportCardsForInitialization(const std::filesystem::path& directory, std::chrono::sys_time<std::chrono::days> lastUpdated) override;
-
-        ImportResult
         ImportCardsForUpdate(const std::filesystem::path& directory,
             const std::map<std::string,uint64_t>& TrackedSets, const std::set<std::string>& SetTypesToIgnore) override;
 
         ImportResult ImportCardsForSetPatch(const std::vector<std::string>& Sets, const std::filesystem::path& Directory) override;
 
-        ImportResult ImportCardForPatch(const std::filesystem::path &directory, const std::string& cardName) override;
+        ImportResult ImportCardForPatch(const std::filesystem::path &directory, const std::string& oracleId) override;
 
         //~End of ImporterBase Interface
 

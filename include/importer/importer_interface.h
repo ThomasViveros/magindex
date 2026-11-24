@@ -1,6 +1,10 @@
 #pragma once
 #include <filesystem>
+#include <map>
+#include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 #include <variant>
 
@@ -19,48 +23,40 @@ namespace magindex::importer {
     struct PatchCards{};
     struct TotalReset{};
 
-    struct ImportResult {
+    class ImportResult {
+    public:
+        using Payload = std::variant<NoUpdate, PatchSets, PatchCards, TotalReset>;
 
         ImportResult() = delete;
 
-        ImportResult(NoUpdate noUpdate) {
-            UpdateType = UpdateType::None;
-        }
+        explicit ImportResult(NoUpdate)
+            : updateType_(UpdateType::None), payload_(NoUpdate{}) {}
 
-        ImportResult(const std::filesystem::path& InPath, PatchSets patch) {
-            InstallFilePath = InPath;
-            ImportVariant = patch;
-        }
-        ImportResult(const std::filesystem::path& InPath, PatchCards patch) {
-            InstallFilePath = InPath;
-            ImportVariant = patch;
-        }
-        ImportResult(const std::filesystem::path& InPath, TotalReset totalReset) {
-            InstallFilePath = InPath;
-            ImportVariant = totalReset;
-        }
+        ImportResult(std::filesystem::path path, PatchSets patch)
+            : updateType_(UpdateType::PatchSets), installFilePath_(std::move(path)),
+              payload_(std::move(patch)) {}
 
+        ImportResult(std::filesystem::path path, PatchCards patch)
+            : updateType_(UpdateType::PatchCards), installFilePath_(std::move(path)),
+              payload_(std::move(patch)) {}
 
-        UpdateType UpdateType = UpdateType::None;
+        ImportResult(std::filesystem::path path, TotalReset reset)
+            : updateType_(UpdateType::TotalReset), installFilePath_(std::move(path)),
+              payload_(std::move(reset)) {}
 
-        //May be empty
-        std::filesystem::path InstallFilePath;
+        [[nodiscard]] UpdateType Type() const noexcept { return updateType_; }
+        [[nodiscard]] const std::filesystem::path& InstallFilePath() const noexcept { return installFilePath_; }
+        [[nodiscard]] const Payload& Data() const noexcept { return payload_; }
 
-        std::variant<NoUpdate, PatchSets, PatchCards, TotalReset> ImportVariant;
+    private:
+        UpdateType updateType_;
+        std::filesystem::path installFilePath_;
+        Payload payload_;
     };
 
     class ImporterBase {
     public:
         virtual ~ImporterBase() = default;
-
-        /**
-            * Gets all cards from source
-            *
-            * @param directory The directory the importer will operate in.
-            * @param lastUpdated When we last updated.
-            */
-        virtual ImportResult ImportCardsForInitialization(const std::filesystem::path& directory,
-            std::chrono::sys_time<std::chrono::days> lastUpdated) = 0;
 
         /**
          * Gets all new cards
@@ -81,10 +77,10 @@ namespace magindex::importer {
         /**
          *
          * @param directory The directory the importer will operate in. (not a file)
-         * @param cardName The name of the card we want to patch
+         * @param oracleId The Scryfall Oracle ID whose printings we want to patch
          * @return ImportResult
          */
-        virtual ImportResult ImportCardForPatch(const std::filesystem::path &directory, const std::string& cardName) = 0;
+        virtual ImportResult ImportCardForPatch(const std::filesystem::path &directory, const std::string& oracleId) = 0;
 
 
     };
